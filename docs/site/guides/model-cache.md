@@ -357,13 +357,21 @@ Properties worth knowing:
   request with the whole file and advertise no `Accept-Ranges`. The downloader
   then discards its partial rather than failing to resume it, so a restart is a
   full re-download instead of a pod that will not start.
-- **A mirror that redirects a file to its own URL fails the download.** This
-  has been seen with an Artifactory `huggingfaceml` remote for some files of a
-  repository while other files of the same repository downloaded fine. The
-  operator's downloader fails with `curl: (47) Maximum (50) redirects
-  followed` and `huggingface_hub` with `TooManyRedirects`. It is a mirror-side
-  problem: `curl -sI <file URL>` against the mirror shows a `Location` equal to
-  the requested URL. Take that output to the mirror's administrators.
+- **A mirror that redirects a file to its own URL breaks runtime downloads.**
+  An Artifactory `huggingfaceml` remote answers a `HEAD` on an LFS file with a
+  `302` whose `Location` equals the requested URL, while small files answer
+  `200`; `curl -sI <file URL>` shows it. `huggingface_hub` resolves file
+  metadata with `HEAD` and follows same-host redirects, so a runtime fails
+  with `TooManyRedirects`. On the remote this was verified against, `GET`
+  returns `200`, and the operator's downloader stages those files: it tolerates
+  the failed `HEAD` and downloads with `GET`. Stage such a model with
+  `spec.files` (see above). If `GET` loops too, the downloader fails with
+  `curl: (47) Maximum (50) redirects followed`. Either way it is mirror-side:
+  take the `curl -sI` output to the mirror's administrators.
+- **`refreshPolicy: OnChange` re-downloads on every start behind such a
+  mirror.** Revalidation reads the size from that same `HEAD`; when it fails,
+  the size is unknown and every file is downloaded again on each pod start.
+  Keep the default `IfNotPresent`.
 
 Rotating the token is a Secret edit; the new value is picked up the next time a
 pod starts, the same as the S3 credentials. An `HF_ENDPOINT` change is also
