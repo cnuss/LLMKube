@@ -246,6 +246,10 @@ func isHFAuthSourceForEndpoint(source, hfEndpoint string) bool {
 	return hfsource.IsHFAuthSourceForEndpoint(source, hfEndpoint)
 }
 
+func isOnHFEndpoint(source, hfEndpoint string) bool {
+	return hfsource.IsOnEndpoint(source, hfEndpoint)
+}
+
 func isHuggingFaceFileURL(source string) bool {
 	return hfsource.IsHuggingFaceFileURL(source)
 }

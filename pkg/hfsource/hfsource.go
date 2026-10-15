@@ -92,6 +92,13 @@ func IsHFAuthSourceForEndpoint(source, hfEndpoint string) bool {
 	if IsHFAuthSource(source) {
 		return true
 	}
+	return IsOnEndpoint(source, hfEndpoint)
+}
+
+// IsOnEndpoint reports whether source is on the origin the HF_ENDPOINT URL
+// names, by the same exact origin rule IsHFAuthSourceForEndpoint applies to the
+// token. An empty or scheme-less HF_ENDPOINT names no origin and matches nothing.
+func IsOnEndpoint(source, hfEndpoint string) bool {
 	return sameOrigin(source, hfEndpoint)
 }
 

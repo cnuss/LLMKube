@@ -487,9 +487,14 @@ func (r *ModelReconciler) validateMultiFileStagingSource(ctx context.Context, mo
 	// mmproj set failed here and the download code was never reached. Verified
 	// on the fleet against a real MinIO, where the Model went straight to
 	// Failed/InvalidFileSet while both objects were fetchable by hand.
-	if !isHFRepoSource(model.Spec.Source) && !isS3Source(model.Spec.Source) && !isOCISource(model.Spec.Source) {
+	//
+	// A repo base on the origin HF_ENDPOINT names is a Hugging Face repo behind
+	// a mirror: the init container fetches "$SOURCE/$rel" with the token for
+	// that origin, so it is admitted like the HF repo path.
+	if !isHFRepoSource(model.Spec.Source) && !isS3Source(model.Spec.Source) && !isOCISource(model.Spec.Source) &&
+		!isOnHFEndpoint(model.Spec.Source, hfEndpointFromSecret(ctx, r.Client, model)) {
 		msg := fmt.Sprintf(
-			"multi-file staging requires a HuggingFace repo, s3://, or oci:// source, but got: %s",
+			"multi-file staging requires a HuggingFace repo, s3://, or oci:// source, or a repo base on the sourceSecretRef's HF_ENDPOINT origin, but got: %s",
 			model.Spec.Source)
 		return true, r.failInvalidFileSet(ctx, model, msg)
 	}
