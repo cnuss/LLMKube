@@ -42,12 +42,12 @@ const (
 )
 
 // hfListingTreeURL returns the Hub API URL that lists the repository source
-// stages from. It must name the same host the init container downloads from:
-// hf:// and huggingface.co sources download from huggingface.co, and a repo
-// base on the HF_ENDPOINT origin downloads from the mirror, whose API root is
-// the endpoint URL itself. Any other source has no listing.
+// stages from. It must name the host the init container downloads from (see
+// stagingRepoBase): for a repo source, hfRepoHost; for a repo base on the
+// HF_ENDPOINT origin, the mirror, whose API root is the endpoint URL itself.
+// Any other source has no listing.
 func hfListingTreeURL(source, hfEndpoint string) (string, bool) {
-	if hasSchemeFold(source, "hf://") || isHuggingFaceURL(source) {
+	if isHFRepoSource(source) {
 		repo, rev, err := parseHFSource(source)
 		if err != nil || repo == "" {
 			return "", false
@@ -55,7 +55,7 @@ func hfListingTreeURL(source, hfEndpoint string) (string, bool) {
 		if rev == "" {
 			rev = "main"
 		}
-		return hfTreeURL(hubAPIBase, repo, url.PathEscape(rev)), true
+		return hfTreeURL(hfRepoHost(hfEndpoint), repo, url.PathEscape(rev)), true
 	}
 	if !isOnHFEndpoint(source, hfEndpoint) {
 		return "", false
@@ -214,4 +214,34 @@ func filesHaveGlob(files []string) bool {
 		}
 	}
 	return false
+}
+
+// stagingRepoBase returns the URL multi-file staging fetches "<base>/<file>"
+// from. A Hugging Face repo source (hf://, a bare repo ID, or a huggingface.co
+// repo URL) resolves on HF_ENDPOINT when the Secret names one, as
+// huggingface_hub does, and on huggingface.co otherwise. Any other source
+// already is that URL, or is not a repo, and is returned unchanged.
+func stagingRepoBase(source, hfEndpoint string) string {
+	if !isHFRepoSource(source) {
+		return source
+	}
+	repo, rev, err := parseHFSource(source)
+	if err != nil || repo == "" {
+		return source
+	}
+	if rev == "" {
+		rev = "main"
+	}
+	return hfRepoHost(hfEndpoint) + "/" + repo + "/resolve/" + url.PathEscape(rev) + "/"
+}
+
+// hfRepoHost is the host a repo source resolves on: the HF_ENDPOINT URL when it
+// names an origin, huggingface.co otherwise. A scheme-less HF_ENDPOINT names no
+// origin, matching the token gate, which would not send it the token either.
+func hfRepoHost(hfEndpoint string) string {
+	ep := strings.TrimRight(hfEndpoint, "/")
+	if isOnHFEndpoint(ep, ep) {
+		return ep
+	}
+	return hubAPIBase
 }

@@ -886,6 +886,12 @@ func (r *ModelReconciler) reconcileRuntimeResolvedSource(ctx context.Context, mo
 
 	isMetal := isMetalModel(model)
 
+	// A repo source with spec.files is staged by the workload's init container
+	// (stagingRepoBase), under the key cachekey.EffectiveKey derives for it.
+	if cacheKey == "" && !isMetal && hasMultiFileStaging(model) && isHFRepoSource(model.Spec.Source) {
+		cacheKey = computeCacheKey(model.Spec.Source)
+	}
+
 	reason := "RuntimeResolved"
 	message := "Source is runtime-resolved (e.g., HuggingFace repo ID); runtime will fetch at startup"
 	if cacheKey == "" && isMetal && isLocalSource(model.Spec.Source) {

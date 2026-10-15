@@ -288,9 +288,9 @@ Some mirrors break runtime downloads of large files. Artifactory's
 `huggingfaceml` remotes answer a `HEAD` on an LFS file with a `302` to its own
 URL; `huggingface_hub` follows same-host redirects, so the runtime fails with
 `TooManyRedirects` (vLLM reports it as `Can't load tokenizer`). The operator's
-downloader is unaffected, so let it stage the checkpoint instead: point
-`spec.source` at the repository base on the mirror and select the files with
-`spec.files`. The runtime then loads a local directory and never calls the Hub.
+downloader is unaffected, so let it stage the checkpoint instead: give the repo
+ID as `spec.source` and select the files with `spec.files`. The runtime then
+loads a local directory and never calls the Hub.
 
 ```yaml
 apiVersion: inference.llmkube.dev/v1alpha1
@@ -298,7 +298,7 @@ kind: Model
 metadata:
   name: glm-5-3-flash
 spec:
-  source: https://artifactory.corp.example/artifactory/api/huggingfaceml/repo/nvidia/GLM-5.3-Flash-NVFP4/resolve/main/
+  source: nvidia/GLM-5.3-Flash-NVFP4
   format: safetensors
   sourceSecretRef:
     name: huggingface        # holds HF_ENDPOINT and HF_TOKEN
@@ -317,14 +317,17 @@ spec:
   runtime: vllm
 ```
 
-The source must be `<HF_ENDPOINT>/<org>/<repo>/resolve/<revision>/` on the
-`HF_ENDPOINT` origin; any other plain `https://` base is rejected for
-`spec.files`.
+With `spec.files`, a repo source (a bare repo ID, `hf://org/repo[@revision]`,
+or a `huggingface.co` repo URL) is staged from `HF_ENDPOINT` when the
+`sourceSecretRef` names one, and from `huggingface.co` otherwise, as
+`huggingface_hub` treats `HF_ENDPOINT`. A bare repo ID **without**
+`spec.files` is unchanged: the runtime downloads it. The mirror's own repo
+base, `<HF_ENDPOINT>/<org>/<repo>/resolve/<revision>/`, also works as the
+source; any other plain `https://` base is rejected for `spec.files`.
 
 Globs in `spec.files` are expanded against the repository's file listing,
-which the Model controller reads from the Hub API of the host the files are
-downloaded from: the mirror for a mirror repo base, `huggingface.co` for an
-`hf://` or `huggingface.co` source. Other sources need explicit paths.
+which the Model controller reads from the Hub API of the same host the files
+are downloaded from. Other sources need explicit paths.
 
 - The expansion is recorded in `status.stagedFiles` when the Model reconciles
   a new generation. Files added upstream later are not picked up until the

@@ -1415,8 +1415,9 @@ func buildCachedStorageConfig(model *inferencev1alpha1.Model, isvc *inferencev1a
 	}
 	if plan != nil {
 		modelPath := stagedCachePath(cacheDir, plan.Primary)
-		cmd := buildMultiFileInitCommand(true, isS3Source(model.Spec.Source), isHFAuthSourceForEndpoint(model.Spec.Source, hfEndpoint), len(model.Spec.FileSHA256) > 0, model.Spec.RefreshPolicy)
-		env := multiFileInitEnvVars(model.Spec.Source, cacheDir, plan.Files, model.Spec.FileSHA256)
+		base := stagingRepoBase(model.Spec.Source, hfEndpoint)
+		cmd := buildMultiFileInitCommand(true, isS3Source(model.Spec.Source), isHFAuthSourceForEndpoint(base, hfEndpoint), len(model.Spec.FileSHA256) > 0, model.Spec.RefreshPolicy)
+		env := multiFileInitEnvVars(base, cacheDir, plan.Files, model.Spec.FileSHA256)
 
 		initVolumeMounts := []corev1.VolumeMount{
 			{Name: "model-cache", MountPath: "/models"},
@@ -1546,8 +1547,9 @@ func buildEmptyDirStorageConfig(model *inferencev1alpha1.Model, isvc *inferencev
 	if plan != nil {
 		stagedDir := fmt.Sprintf("/models/%s-%s", namespace, model.Name)
 		modelPath := fmt.Sprintf("%s/%s", stagedDir, plan.Primary)
-		cmd := buildMultiFileInitCommand(false, isS3Source(model.Spec.Source), isHFAuthSourceForEndpoint(model.Spec.Source, hfEndpoint), len(model.Spec.FileSHA256) > 0, model.Spec.RefreshPolicy)
-		env := multiFileInitEnvVars(model.Spec.Source, stagedDir, plan.Files, model.Spec.FileSHA256)
+		base := stagingRepoBase(model.Spec.Source, hfEndpoint)
+		cmd := buildMultiFileInitCommand(false, isS3Source(model.Spec.Source), isHFAuthSourceForEndpoint(base, hfEndpoint), len(model.Spec.FileSHA256) > 0, model.Spec.RefreshPolicy)
+		env := multiFileInitEnvVars(base, stagedDir, plan.Files, model.Spec.FileSHA256)
 
 		initVolumeMounts := []corev1.VolumeMount{{Name: "model-storage", MountPath: "/models"}}
 		volumes := []corev1.Volume{

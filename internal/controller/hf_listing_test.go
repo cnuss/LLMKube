@@ -20,10 +20,12 @@ import (
 )
 
 // The listing must come from the same place the init container downloads from,
-// or a glob expands against one repository and fetches from another. hf:// and
-// huggingface.co URLs download from huggingface.co; a repo base on the
-// HF_ENDPOINT origin downloads from the mirror, so it lists from the mirror's
-// API root (the endpoint URL, path included). Anything else has no listing.
+// or a glob expands against one repository and fetches from another. A repo
+// source (hf://, a bare repo ID, a huggingface.co repo URL) stages from
+// HF_ENDPOINT when the Secret names one and from huggingface.co otherwise; a
+// repo base on the HF_ENDPOINT origin stages from the mirror. Each lists from
+// that host's API root (for a mirror, the endpoint URL, path included).
+// Anything else has no listing.
 func TestHFListingTreeURL(t *testing.T) {
 	const ep = "https://artifactory.corp.example/artifactory/api/huggingfaceml/hf-remote"
 	tests := []struct {
@@ -34,8 +36,11 @@ func TestHFListingTreeURL(t *testing.T) {
 	}{
 		{"hf scheme", "hf://Qwen/Qwen2.5-0.5B-Instruct", "", "https://huggingface.co/api/models/Qwen/Qwen2.5-0.5B-Instruct/tree/main?recursive=true"},
 		{"hf scheme with revision", "hf://Qwen/Qwen2.5-0.5B-Instruct@7ae557604adf67be50417f59c2c2f167def9a775", "", "https://huggingface.co/api/models/Qwen/Qwen2.5-0.5B-Instruct/tree/7ae557604adf67be50417f59c2c2f167def9a775?recursive=true"},
-		{"hf scheme ignores the mirror, as the download does", "hf://Qwen/Qwen2.5-0.5B-Instruct", ep, "https://huggingface.co/api/models/Qwen/Qwen2.5-0.5B-Instruct/tree/main?recursive=true"},
+		{"hf scheme lists from the mirror", "hf://Qwen/Qwen2.5-0.5B-Instruct", ep, ep + "/api/models/Qwen/Qwen2.5-0.5B-Instruct/tree/main?recursive=true"},
 		{"huggingface.co resolve base", "https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct/resolve/main/", "", "https://huggingface.co/api/models/Qwen/Qwen2.5-0.5B-Instruct/tree/main?recursive=true"},
+		{"huggingface.co resolve base lists from the mirror", "https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct/resolve/main/", ep, ep + "/api/models/Qwen/Qwen2.5-0.5B-Instruct/tree/main?recursive=true"},
+		{"bare repo id", "nvidia/GLM-5.3-Flash-NVFP4", "", "https://huggingface.co/api/models/nvidia/GLM-5.3-Flash-NVFP4/tree/main?recursive=true"},
+		{"bare repo id lists from the mirror", "nvidia/GLM-5.3-Flash-NVFP4", ep, ep + "/api/models/nvidia/GLM-5.3-Flash-NVFP4/tree/main?recursive=true"},
 		{"mirror repo base", ep + "/nvidia/GLM-5.3-Flash-NVFP4/resolve/main/", ep, ep + "/api/models/nvidia/GLM-5.3-Flash-NVFP4/tree/main?recursive=true"},
 		{"mirror repo base without trailing slash", ep + "/nvidia/GLM-5.3-Flash-NVFP4/resolve/main", ep + "/", ep + "/api/models/nvidia/GLM-5.3-Flash-NVFP4/tree/main?recursive=true"},
 		{"mirror revision is path-escaped", ep + "/org/repo/resolve/refs%2Fpr%2F1/", ep, ep + "/api/models/org/repo/tree/refs%2Fpr%2F1?recursive=true"},
@@ -43,7 +48,6 @@ func TestHFListingTreeURL(t *testing.T) {
 		{"mirror base without HF_ENDPOINT", ep + "/org/repo/resolve/main/", "", ""},
 		{"lookalike host", "https://artifactory.corp.example.evil.example/artifactory/api/huggingfaceml/hf-remote/org/repo/resolve/main/", ep, ""},
 		{"mirror path that is not a resolve base", ep + "/org/repo/blob/main/", ep, ""},
-		{"bare repo id", "Qwen/Qwen2.5-0.5B-Instruct", "", ""},
 		{"s3", "s3://bucket/prefix", ep, ""},
 	}
 	for _, tt := range tests {

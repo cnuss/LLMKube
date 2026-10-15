@@ -83,7 +83,11 @@ func prefetchEligible(model *inferencev1alpha1.Model) bool {
 	// original semantics without depending on isRemoteHTTPSource's repo-vs-file
 	// classification.
 	normalized := normalizeHFSource(model.Spec.Source)
-	return hasSchemeFold(normalized, "https://") || hasSchemeFold(normalized, "http://")
+	if hasSchemeFold(normalized, "https://") || hasSchemeFold(normalized, "http://") {
+		return true
+	}
+	// A bare repo ID with spec.files is staged by the operator (stagingRepoBase).
+	return hasMultiFileStaging(model) && isHFRepoSource(model.Spec.Source)
 }
 
 // DefaultPrefetchJobReadTimeout bounds the read of the prefetch Job. Generous
