@@ -817,7 +817,11 @@ func modelStagingPlan(model *inferencev1alpha1.Model) (*StagingPlan, error) {
 	if !hasMultiFileStaging(model) {
 		return nil, nil
 	}
-	plan, err := ResolveFileSet(model.Spec.Files, model.Spec.Mmproj, nil)
+	files, err := stagedFileEntries(model)
+	if err != nil {
+		return nil, fmt.Errorf("invalid fileset: %w", err)
+	}
+	plan, err := ResolveFileSet(files, model.Spec.Mmproj, nil)
 	if err != nil {
 		return nil, fmt.Errorf("invalid fileset: %w", err)
 	}
@@ -825,6 +829,21 @@ func modelStagingPlan(model *inferencev1alpha1.Model) (*StagingPlan, error) {
 		return nil, nil
 	}
 	return plan, nil
+}
+
+// stagedFileEntries returns the file entries to stage: spec.files as written,
+// or, when it holds a glob, the expansion the Model controller recorded in
+// status.stagedFiles. The expansion is trusted only for the current generation;
+// one written for an older spec would stage the wrong set.
+func stagedFileEntries(model *inferencev1alpha1.Model) ([]string, error) {
+	if !filesHaveGlob(model.Spec.Files) {
+		return model.Spec.Files, nil
+	}
+	gen, ok := availableObservedGeneration(model)
+	if len(model.Status.StagedFiles) == 0 || !ok || gen != model.Generation {
+		return nil, fmt.Errorf("spec.files has a glob and the Model has not recorded its expansion for generation %d", model.Generation)
+	}
+	return model.Status.StagedFiles, nil
 }
 
 // invalidFileSetInitContainer returns an init container that immediately exits

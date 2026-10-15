@@ -909,7 +909,18 @@ func (r *ModelReconciler) reconcileRuntimeResolvedSource(ctx context.Context, mo
 
 	// Validate multi-file staging before marking Ready.
 	if hasMultiFileStaging(model) {
-		plan, err := ResolveFileSet(model.Spec.Files, model.Spec.Mmproj, nil)
+		repoFiles, listErr := r.repoFileListing(ctx, model)
+		if listErr != nil {
+			model.Status.Phase = PhaseFailed
+			model.Status.StagedFiles = nil
+			if updateErr := r.updateStatus(ctx, model, ConditionDegraded, metav1.ConditionTrue, "RepoListingFailed",
+				"spec.files has a glob and listing the source repository failed: "+listErr.Error()); updateErr != nil {
+				logger.Error(updateErr, "Failed to update status after repository listing failure")
+			}
+			llmkubemetrics.ReconcileTotal.WithLabelValues("model", "error").Inc()
+			return ctrl.Result{RequeueAfter: time.Minute}, nil
+		}
+		plan, err := ResolveFileSet(model.Spec.Files, model.Spec.Mmproj, repoFiles)
 		if err != nil {
 			model.Status.Phase = PhaseFailed
 			if updateErr := r.updateStatus(ctx, model, ConditionDegraded, metav1.ConditionTrue, "InvalidFileSet", err.Error()); updateErr != nil {

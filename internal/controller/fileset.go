@@ -107,7 +107,7 @@ func expandFilePattern(entry string, repoFileList []string) ([]string, error) {
 	}
 
 	if repoFileList == nil {
-		return nil, fmt.Errorf("glob pattern %q requires repository file listing, which is unavailable in production: use explicit file paths", entry)
+		return nil, fmt.Errorf("glob pattern %q requires a repository listing, which only an hf://, huggingface.co, or HF_ENDPOINT mirror repo source provides: use explicit file paths", entry)
 	}
 
 	matches := make([]string, 0)

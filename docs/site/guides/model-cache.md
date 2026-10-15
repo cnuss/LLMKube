@@ -282,6 +282,59 @@ A Model can name one mirror origin. A speculative-decoding draft Model that
 the runtime downloads itself uses the target Model's mirror, because both run
 in the same container.
 
+#### Staging a multi-file checkpoint through the mirror
+
+Some mirrors break runtime downloads of large files. Artifactory's
+`huggingfaceml` remotes answer a `HEAD` on an LFS file with a `302` to its own
+URL; `huggingface_hub` follows same-host redirects, so the runtime fails with
+`TooManyRedirects` (vLLM reports it as `Can't load tokenizer`). The operator's
+downloader is unaffected, so let it stage the checkpoint instead: point
+`spec.source` at the repository base on the mirror and select the files with
+`spec.files`. The runtime then loads a local directory and never calls the Hub.
+
+```yaml
+apiVersion: inference.llmkube.dev/v1alpha1
+kind: Model
+metadata:
+  name: glm-5-3-flash
+spec:
+  source: https://artifactory.corp.example/artifactory/api/huggingfaceml/repo/nvidia/GLM-5.3-Flash-NVFP4/resolve/main/
+  format: safetensors
+  sourceSecretRef:
+    name: huggingface        # holds HF_ENDPOINT and HF_TOKEN
+  files:
+    - config.json            # the primary: must match exactly one file
+    - "*.json"
+    - "*.jinja"
+    - "*.safetensors"
+---
+apiVersion: inference.llmkube.dev/v1alpha1
+kind: InferenceService
+metadata:
+  name: glm
+spec:
+  modelRef: glm-5-3-flash
+  runtime: vllm
+```
+
+The source must be `<HF_ENDPOINT>/<org>/<repo>/resolve/<revision>/` on the
+`HF_ENDPOINT` origin; any other plain `https://` base is rejected for
+`spec.files`.
+
+Globs in `spec.files` are expanded against the repository's file listing,
+which the Model controller reads from the Hub API of the host the files are
+downloaded from: the mirror for a mirror repo base, `huggingface.co` for an
+`hf://` or `huggingface.co` source. Other sources need explicit paths.
+
+- The expansion is recorded in `status.stagedFiles` when the Model reconciles
+  a new generation. Files added upstream later are not picked up until the
+  spec changes.
+- A pattern matches within one directory (`*.safetensors` does not match
+  `sub/x.safetensors`; write `sub/*.safetensors`).
+- A failed listing fails the Model with reason `RepoListingFailed` and the
+  cause, and is retried every minute.
+- `spec.fileSha256` still needs explicit paths.
+
 Properties worth knowing:
 
 - **The token is only ever sent to `huggingface.co`, or to the origin named by

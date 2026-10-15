@@ -202,7 +202,7 @@ func resolveStagedCompanions(isvc *inferencev1alpha1.InferenceService, model *in
 	}
 
 	baseDir := ""
-	if plan, err := ResolveFileSet(model.Spec.Files, model.Spec.Mmproj, nil); err == nil && plan != nil && plan.Primary != "" {
+	if plan, err := modelStagingPlan(model); err == nil && plan != nil && plan.Primary != "" {
 		baseDir = path.Dir(modelPath)
 		if suffix := "/" + plan.Primary; strings.HasSuffix(modelPath, suffix) {
 			baseDir = modelPath[:len(modelPath)-len(suffix)]
