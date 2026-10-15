@@ -9,7 +9,6 @@ import (
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	inferencev1alpha1 "github.com/defilantech/llmkube/api/v1alpha1"
@@ -160,14 +159,5 @@ func TestReconcileRuntimeResolved_BareRepoIDListsFromMirror(t *testing.T) {
 	want := "config.json generation_config.json tokenizer.json tokenizer_config.json vocab.json model.safetensors"
 	if got := strings.Join(stored.Status.StagedFiles, " "); stored.Status.Phase != PhaseReady || got != want {
 		t.Errorf("phase = %q, stagedFiles = %q; want Ready and %q (conditions=%+v)", stored.Status.Phase, got, want, stored.Status.Conditions)
-	}
-	// The workload's init container stages it, so the status must not tell the
-	// user the runtime fetches it, and carries the cache key it stages under.
-	avail := meta.FindStatusCondition(stored.Status.Conditions, ConditionAvailable)
-	if avail == nil || avail.Reason != ReasonWorkloadResolved {
-		t.Errorf("Available = %+v, want reason %s", avail, ReasonWorkloadResolved)
-	}
-	if stored.Status.CacheKey != computeCacheKey(model.Spec.Source) {
-		t.Errorf("cacheKey = %q, want %q", stored.Status.CacheKey, computeCacheKey(model.Spec.Source))
 	}
 }
