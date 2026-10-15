@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"reflect"
 	"sort"
@@ -318,4 +319,175 @@ func getModel(t *testing.T, r *ModelReconciler, name string) *inferencev1alpha1.
 		t.Fatalf("get Model: %v", err)
 	}
 	return m
+}
+
+// A server that keeps answering with a next link must not hold the reconcile
+// forever; the listing gives up at the page cap with an error.
+func TestListHFRepoFiles_StopsAtPageCap(t *testing.T) {
+	var pages int
+	var srv *httptest.Server
+	srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		pages++
+		w.Header().Set("Link", fmt.Sprintf(`<%s/api/models/org/repo/tree/main?cursor=%d>; rel="next"`, srv.URL, pages))
+		_, _ = w.Write([]byte(`[{"type":"file","path":"a.safetensors"}]`))
+	}))
+	defer srv.Close()
+
+	_, err := listHFRepoFiles(context.Background(), loopbackSafeClient(), srv.URL+"/api/models/org/repo/tree/main?recursive=true", "")
+	if err == nil || !strings.Contains(err.Error(), "pages") {
+		t.Fatalf("err = %v, want the page cap", err)
+	}
+	if pages != maxHFListingPages {
+		t.Errorf("fetched %d pages, want exactly %d", pages, maxHFListingPages)
+	}
+}
+
+// A proxy error page served as 200 must fail the listing, not expand every
+// glob to nothing.
+func TestListHFRepoFiles_RejectsNonJSONBody(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`<html>Bad gateway</html>`))
+	}))
+	defer srv.Close()
+
+	if _, err := listHFRepoFiles(context.Background(), loopbackSafeClient(), srv.URL+"/api/models/org/repo/tree/main?recursive=true", ""); err == nil || !strings.Contains(err.Error(), "decode") {
+		t.Fatalf("err = %v, want a decode error", err)
+	}
+}
+
+// The controller lists through its SSRF-guarded client, so a listing host
+// outside allowedRemoteHosts that resolves to a blocked address is refused and
+// fails the listing, and no request reaches it.
+func TestRepoFileListing_SSRFGuardRefusesBlockedHost(t *testing.T) {
+	var hit bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hit = true
+		_, _ = w.Write([]byte(`[]`))
+	}))
+	defer srv.Close()
+	endpoint := srv.URL + "/artifactory/api/huggingfaceml/hf-remote"
+	model := &inferencev1alpha1.Model{
+		ObjectMeta: metav1.ObjectMeta{Name: "m", Namespace: "default"},
+		Spec: inferencev1alpha1.ModelSpec{
+			Source:          endpoint + "/org/repo/resolve/main/",
+			Files:           []string{"config.json", "*.safetensors"},
+			SourceSecretRef: &corev1.LocalObjectReference{Name: "huggingface"},
+		},
+	}
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "huggingface", Namespace: "default"},
+		Data:       map[string][]byte{"HF_ENDPOINT": []byte(endpoint), "HF_TOKEN": []byte("hf_tok")},
+	}
+	r := newMultiFileGateReconciler(t, model, secret)
+	if _, err := r.repoFileListing(context.Background(), model); err == nil {
+		t.Fatal("listing reached a loopback host the SSRF guard should refuse")
+	}
+	if hit {
+		t.Error("request reached the blocked host")
+	}
+}
+
+func TestNextLink(t *testing.T) {
+	base, _ := url.Parse("https://mirror.example/api/models/org/repo/tree/main?recursive=true")
+	tests := []struct {
+		name    string
+		headers []string
+		want    string
+	}{
+		{"none", nil, ""},
+		{"next", []string{`<https://mirror.example/p2>; rel="next"`}, "https://mirror.example/p2"},
+		{"relative target", []string{`</api/models/org/repo/tree/main?cursor=c2>; rel="next"`}, "https://mirror.example/api/models/org/repo/tree/main?cursor=c2"},
+		{"unquoted rel", []string{`<https://mirror.example/p2>; rel=next`}, "https://mirror.example/p2"},
+		{"next among several links", []string{`<https://mirror.example/p0>; rel="prev", <https://mirror.example/p2>; rel="next"`}, "https://mirror.example/p2"},
+		{"only prev", []string{`<https://mirror.example/p0>; rel="prev"`}, ""},
+		{"malformed entry skipped", []string{`https://mirror.example/p2; rel="next"`}, ""},
+		{"no params", []string{`<https://mirror.example/p2>`}, ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := nextLink(tt.headers, base)
+			if err != nil || got != tt.want {
+				t.Errorf("nextLink(%q) = %q, %v; want %q", tt.headers, got, err, tt.want)
+			}
+		})
+	}
+}
+
+// Listing happens only when a glob needs it. Without a glob, or for a source
+// that has no listing, repoFileListing makes no request and returns nil, so
+// explicit files keep working with no controller egress and a glob on an
+// unlistable source is left for ResolveFileSet to reject.
+func TestRepoFileListing_NoRequestWithoutNeed(t *testing.T) {
+	var hits int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		_, _ = w.Write([]byte(`[]`))
+	}))
+	defer srv.Close()
+	endpoint := srv.URL + "/artifactory/api/huggingfaceml/hf-remote"
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "huggingface", Namespace: "default"},
+		Data:       map[string][]byte{"HF_ENDPOINT": []byte(endpoint)},
+	}
+
+	tests := []struct {
+		name, source string
+		files        []string
+	}{
+		{"explicit files on a listable source", endpoint + "/org/repo/resolve/main/", []string{"config.json", "model.safetensors"}},
+		{"glob on a source with no listing", "s3://bucket/prefix", []string{"*.safetensors"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			model := &inferencev1alpha1.Model{
+				ObjectMeta: metav1.ObjectMeta{Name: "m", Namespace: "default"},
+				Spec: inferencev1alpha1.ModelSpec{
+					Source: tt.source, Files: tt.files,
+					SourceSecretRef: &corev1.LocalObjectReference{Name: "huggingface"},
+				},
+			}
+			r := newMultiFileGateReconciler(t, model, secret)
+			r.AllowedRemoteHosts = []string{"127.0.0.1"}
+			got, err := r.repoFileListing(context.Background(), model)
+			if err != nil || got != nil {
+				t.Errorf("repoFileListing = %v, %v; want nil, nil", got, err)
+			}
+		})
+	}
+	if hits != 0 {
+		t.Errorf("made %d listing requests, want none", hits)
+	}
+}
+
+// An ungated repository lists without a token, so a missing Secret, a missing
+// ref, or a Secret without HF_TOKEN yields no token rather than an error. The
+// value is trimmed, as an env-projected Secret often ends in a newline.
+func TestHFTokenFromSecret(t *testing.T) {
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "huggingface", Namespace: "default"},
+		Data:       map[string][]byte{"HF_TOKEN": []byte("hf_tok\n")},
+	}
+	model := func(ref string) *inferencev1alpha1.Model {
+		m := &inferencev1alpha1.Model{ObjectMeta: metav1.ObjectMeta{Name: "m", Namespace: "default"}}
+		if ref != "" {
+			m.Spec.SourceSecretRef = &corev1.LocalObjectReference{Name: ref}
+		}
+		return m
+	}
+	r := newMultiFileGateReconciler(t, model(""), secret)
+	tests := []struct{ name, ref, want string }{
+		{"no ref", "", ""},
+		{"missing Secret", "absent", ""},
+		{"token trimmed", "huggingface", "hf_tok"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := r.hfTokenFromSecret(context.Background(), model(tt.ref)); got != tt.want {
+				t.Errorf("hfTokenFromSecret = %q, want %q", got, tt.want)
+			}
+		})
+	}
+	if got := (&ModelReconciler{}).hfTokenFromSecret(context.Background(), model("huggingface")); got != "" {
+		t.Errorf("nil client: hfTokenFromSecret = %q, want empty", got)
+	}
 }
