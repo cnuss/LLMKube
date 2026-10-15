@@ -5,6 +5,27 @@ All notable changes to LLMKube will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.10.4](https://github.com/defilantech/LLMKube/compare/v0.10.3...v0.10.4) (2026-10-15)
+
+
+### Features
+
+* **api:** endpoint API key and externalTrafficPolicy for InferenceService ([#2043](https://github.com/defilantech/LLMKube/issues/2043)) ([27a9214](https://github.com/defilantech/LLMKube/commit/27a9214d4dc4e0bd2f2c5374b306af85535ff89f))
+* **controller:** detect keyed pool siblings and vLLM env-var keys in ModelRouter ([#2068](https://github.com/defilantech/LLMKube/issues/2068)) ([78889f0](https://github.com/defilantech/LLMKube/commit/78889f0460c84441e45937016803fbd5a81b99fb))
+* **controller:** detect ModelRouter backends keyed through --api-key on the command line ([#2063](https://github.com/defilantech/LLMKube/issues/2063)) ([3674acc](https://github.com/defilantech/LLMKube/commit/3674accef62124c37728a48edf6dabe9f3a0822b))
+
+
+### Bug Fixes
+
+* **controller:** merge DRA pod scheduling fields and reject multiNode with resourceClaims ([#2062](https://github.com/defilantech/LLMKube/issues/2062)) ([9319745](https://github.com/defilantech/LLMKube/commit/9319745bd79fde8695aa4a631e1bfe998050b977))
+* no device-plugin GPU limit when a Model uses DRA resourceClaims ([#2060](https://github.com/defilantech/LLMKube/issues/2060)) ([8c3e434](https://github.com/defilantech/LLMKube/commit/8c3e434d583dd50b3c1027bb7c71eb2d83951067))
+
+
+### Documentation
+
+* APISIX in front of LLMKube ([#2053](https://github.com/defilantech/LLMKube/issues/2053)) ([16286c6](https://github.com/defilantech/LLMKube/commit/16286c681f4cc7b8555a80793468ee11f0d3b36d))
+* use an extension-less link in the GPU fault guide ([#2056](https://github.com/defilantech/LLMKube/issues/2056)) ([780e710](https://github.com/defilantech/LLMKube/commit/780e7102ff8c8a9794d0a42f3c1b7b5c5c93c27a))
+
 ## [0.10.3](https://github.com/defilantech/LLMKube/compare/v0.10.2...v0.10.3) (2026-10-13)
 
 
