@@ -353,7 +353,19 @@ func addCACertVolume(volumes *[]corev1.Volume, mounts *[]corev1.VolumeMount, cmd
 // curl drops a caller-supplied Authorization header when a redirect crosses to
 // a different host, which is exactly what the LFS handoff to the CDN needs, so
 // --location-trusted must NOT be added here.
-const hfAuthFn = `hf_curl() { if [ -n "${HF_TOKEN:-}" ]; then curl -H "Authorization: Bearer ${HF_TOKEN}" "$@"; else curl "$@"; fi; }` + " && "
+//
+// The header reaches curl as config on stdin (-K -), not as an argument: a
+// process's arguments are readable from /proc/<pid>/cmdline by anything in its
+// PID namespace, and printf is a shell builtin, so the token is never in any
+// process's argv (#2097). curl's config syntax ends a quoted value at a quote
+// and treats a backslash as an escape, so a token holding either is refused
+// rather than sent altered.
+const hfAuthFn = `hf_curl() { if [ -n "${HF_TOKEN:-}" ]; then case "$HF_TOKEN" in *'"'*|*'\'*) echo "ERROR: HF_TOKEN contains a quote or backslash, which curl config cannot carry" >&2; return 1;; esac; printf 'header = "Authorization: Bearer %s"\n' "$HF_TOKEN" | curl -K - "$@"; else curl "$@"; fi; }` + " && "
+
+// s3AuthFn defines s3_curl, the helper every S3 transfer goes through. It
+// signs with SigV4 using the spec.sourceSecretRef AWS_* keys, passed to curl
+// as config on stdin for the reason hfAuthFn gives.
+const s3AuthFn = `s3_curl() { case "${AWS_ACCESS_KEY_ID:-}${AWS_SECRET_ACCESS_KEY:-}" in *'"'*|*'\'*) echo "ERROR: AWS_ACCESS_KEY_ID or AWS_SECRET_ACCESS_KEY contains a quote or backslash, which curl config cannot carry" >&2; return 1;; esac; printf 'user = "%s:%s"\n' "${AWS_ACCESS_KEY_ID:-}" "${AWS_SECRET_ACCESS_KEY:-}" | curl --aws-sigv4 "aws:amz:${AWS_REGION}:s3" -K - "$@"; }` + " && "
 
 // downloadProgressFn defines download_with_progress, the shell helper every
 // transfer runs under so kubectl logs -c model-downloader shows newline-
@@ -450,7 +462,7 @@ func buildModelInitCommand(isLocal, isS3, useCache, isHFAuth, withSHA256 bool, r
 			return fns + pre + `mkdir -p "$CACHE_DIR" && rm -f "$MODEL_PATH.tmp" && ` + frames(`echo 'Copying model from local source...'; cp /host-model/model.gguf "$MODEL_PATH.tmp" && `+publish("$MODEL_PATH.tmp")+` && echo 'Model copied successfully'`, "Model already cached, skipping copy")
 		}
 		if isS3 {
-			return fns + pre + `mkdir -p "$CACHE_DIR" && rm -f "$MODEL_PATH.tmp" && ` + frames(`echo 'Downloading model from S3...'; `+downloadProgressFn+`download_with_progress "$MODEL_PATH.tmp" "" curl --aws-sigv4 "aws:amz:${AWS_REGION}:s3" -u "${AWS_ACCESS_KEY_ID}:${AWS_SECRET_ACCESS_KEY}" -f -L -o "$MODEL_PATH.tmp" "${AWS_ENDPOINT_URL}/${S3_BUCKET}/${S3_KEY}" --no-progress-meter && `+publish("$MODEL_PATH.tmp")+` && echo 'Model downloaded successfully'`, "Model already cached, skipping download")
+			return fns + pre + `mkdir -p "$CACHE_DIR" && rm -f "$MODEL_PATH.tmp" && ` + frames(`echo 'Downloading model from S3...'; `+downloadProgressFn+s3AuthFn+`download_with_progress "$MODEL_PATH.tmp" "" s3_curl -f -L -o "$MODEL_PATH.tmp" "${AWS_ENDPOINT_URL}/${S3_BUCKET}/${S3_KEY}" --no-progress-meter && `+publish("$MODEL_PATH.tmp")+` && echo 'Model downloaded successfully'`, "Model already cached, skipping download")
 		}
 		if refreshPolicy == RefreshPolicyOnChange {
 			return fns + pre + "mkdir -p \"$CACHE_DIR\" && " + debrisSweep() + hfAuthPrefix(isHFAuth) + remoteRevalidateScript(isHFAuth, withSHA256)
@@ -462,7 +474,7 @@ func buildModelInitCommand(isLocal, isS3, useCache, isHFAuth, withSHA256 bool, r
 		return `echo 'ERROR: Local model source requires model cache to be configured.'; exit 1`
 	}
 	if isS3 {
-		return fns + pre + frames(`echo 'Downloading model from S3...'; `+downloadProgressFn+`download_with_progress "$MODEL_PATH.tmp" "" curl --aws-sigv4 "aws:amz:${AWS_REGION}:s3" -u "${AWS_ACCESS_KEY_ID}:${AWS_SECRET_ACCESS_KEY}" -f -L -o "$MODEL_PATH.tmp" "${AWS_ENDPOINT_URL}/${S3_BUCKET}/${S3_KEY}" --no-progress-meter && `+publish("$MODEL_PATH.tmp")+` && echo 'Model downloaded successfully'`, "Model already exists, skipping download")
+		return fns + pre + frames(`echo 'Downloading model from S3...'; `+downloadProgressFn+s3AuthFn+`download_with_progress "$MODEL_PATH.tmp" "" s3_curl -f -L -o "$MODEL_PATH.tmp" "${AWS_ENDPOINT_URL}/${S3_BUCKET}/${S3_KEY}" --no-progress-meter && `+publish("$MODEL_PATH.tmp")+` && echo 'Model downloaded successfully'`, "Model already exists, skipping download")
 	}
 	if refreshPolicy == RefreshPolicyOnChange {
 		return fns + pre + hfAuthPrefix(isHFAuth) + remoteRevalidateScript(isHFAuth, withSHA256)
@@ -989,6 +1001,9 @@ func buildMultiFileInitCommand(useCache, isS3, isHFAuth, withSHA256 bool, refres
 	// Every branch transfers per file, so the heartbeat helper rides the prefix
 	// once rather than being concatenated at each call site.
 	prefix = downloadProgressFn + prefix
+	if isS3 {
+		prefix = s3AuthFn + prefix
+	}
 
 	normalizeFn := `normalize_hf_source() { case "$1" in hf://*) src="${1#hf://}"; rev="${src#*@}"; if [ "$rev" != "$src" ]; then echo "https://huggingface.co/${src%%@*}/resolve/$rev/"; else echo "https://huggingface.co/$src/resolve/main/"; fi ;; *) echo "$1" ;; esac; }` + " && "
 
@@ -1042,11 +1057,11 @@ func buildMultiFileInitCommand(useCache, isS3, isHFAuth, withSHA256 bool, refres
 				`mkdir -p "$(dirname "$dest")"; ` + digestAssign + markerGuard +
 				`key="${S3_PREFIX:+${S3_PREFIX}/}$rel"; ` +
 				`url="${AWS_ENDPOINT_URL}/${S3_BUCKET}/${key}"; ` +
-				`remote_size=$(curl --aws-sigv4 "aws:amz:${AWS_REGION}:s3" -u "${AWS_ACCESS_KEY_ID}:${AWS_SECRET_ACCESS_KEY}" -fsSL -I "$url" -o /dev/null -w '%header{content-length}' 2>/dev/null || echo 0); ` +
+				`remote_size=$(s3_curl -fsSL -I "$url" -o /dev/null -w '%header{content-length}' 2>/dev/null || echo 0); ` +
 				`if [ -f "$dest" ] && [ "$(stat -c %s "$dest" 2>/dev/null || echo 0)" = "$remote_size" ] && [ "$remote_size" != "0" ]` + sizeHit + `; then ` +
 				`echo "Model artifact $rel revalidated (unchanged, skipped download)"; ` +
 				`else ` +
-				`if download_with_progress "$dest.tmp" "" curl --aws-sigv4 "aws:amz:${AWS_REGION}:s3" -u "${AWS_ACCESS_KEY_ID}:${AWS_SECRET_ACCESS_KEY}" -f -L -o "$dest.tmp" "$url" --no-progress-meter && ` + publishFile("$dest.tmp") + `; then ` +
+				`if download_with_progress "$dest.tmp" "" s3_curl -f -L -o "$dest.tmp" "$url" --no-progress-meter && ` + publishFile("$dest.tmp") + `; then ` +
 				`echo "Model artifact $rel revalidated (downloaded)"; ` +
 				keepCachedTail +
 				`fi; ` +
@@ -1055,7 +1070,7 @@ func buildMultiFileInitCommand(useCache, isS3, isHFAuth, withSHA256 bool, refres
 		}
 
 		download := `echo "Downloading model artifact $rel..."; ` +
-			`download_with_progress "$dest.tmp" "" curl --aws-sigv4 "aws:amz:${AWS_REGION}:s3" -u "${AWS_ACCESS_KEY_ID}:${AWS_SECRET_ACCESS_KEY}" -f -L -o "$dest.tmp" "$url" --no-progress-meter && ` + publishFile("$dest.tmp") + ` || { echo "ERROR: failed to download $rel"; exit 1; }; `
+			`download_with_progress "$dest.tmp" "" s3_curl -f -L -o "$dest.tmp" "$url" --no-progress-meter && ` + publishFile("$dest.tmp") + ` || { echo "ERROR: failed to download $rel"; exit 1; }; `
 		body := normalizeFn +
 			`SOURCE="$(normalize_hf_source "$MODEL_SOURCE")" && ` +
 			`printf '%s\n' "$MODEL_FILES" | while IFS= read -r rel; do ` +

@@ -134,7 +134,7 @@ func TestMultiFileInitContainer_HFMirrorRepoBase(t *testing.T) {
 	for _, a := range downloader.Args {
 		script += a
 	}
-	if !containsAll(script, `-H "Authorization: Bearer ${HF_TOKEN}"`, `url="${SOURCE%/}/$rel"`) {
+	if !containsAll(script, authHeader, `url="${SOURCE%/}/$rel"`) {
 		t.Errorf("downloader does not fetch $SOURCE/$rel with the bearer header:\n%s", script)
 	}
 }

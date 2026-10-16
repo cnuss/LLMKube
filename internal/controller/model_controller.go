@@ -1500,7 +1500,7 @@ func (r *ModelReconciler) s3ContentLength(ctx context.Context, httpClient *http.
 // sigv4RoundTripper signs each request to endpoint with AWS Signature Version
 // 4 for the s3 service, then delegates to the wrapped transport (the
 // SSRF-guarded one). This is the in-process equivalent of the init container's
-// `curl --aws-sigv4 "aws:amz:${AWS_REGION}:s3" -u "${AWS_ACCESS_KEY_ID}:${AWS_SECRET_ACCESS_KEY}"`.
+// s3_curl helper (s3AuthFn).
 // pkg/agent/s3.go carries a copy for the metal-agent; the two share the
 // origin check, safehttp.SameOrigin.
 //

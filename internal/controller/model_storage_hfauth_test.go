@@ -98,7 +98,7 @@ func TestHFPathSegmentsPreserveCase(t *testing.T) {
 // authHeader is the exact text a gated fetch must carry. Asserting the whole
 // string rather than a substring keeps a malformed header (a missing space
 // after "Bearer", say) from passing.
-const authHeader = `-H "Authorization: Bearer ${HF_TOKEN}"`
+const authHeader = `header = "Authorization: Bearer %s"`
 
 func TestBuildModelInitCommand_HFAuth(t *testing.T) {
 	for _, policy := range []string{RefreshPolicyIfNotPresent, RefreshPolicyOnChange} {

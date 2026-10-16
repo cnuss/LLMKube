@@ -56,7 +56,7 @@ func TestPrefetchJob_CarriesHFAuth(t *testing.T) {
 	}
 
 	script := strings.Join(downloader.Command, " ")
-	if !strings.Contains(script, `-H "Authorization: Bearer ${HF_TOKEN}"`) {
+	if !strings.Contains(script, authHeader) {
 		t.Errorf("prefetch downloader sends no bearer header:\n%s", script)
 	}
 }
@@ -122,7 +122,7 @@ func TestPrefetchJob_CarriesHFAuthForMirror(t *testing.T) {
 	for _, c := range job.Spec.Template.Spec.InitContainers {
 		script += strings.Join(c.Command, " ")
 	}
-	if !strings.Contains(script, `-H "Authorization: Bearer ${HF_TOKEN}"`) {
+	if !strings.Contains(script, authHeader) {
 		t.Errorf("mirror prefetch downloader sends no bearer header:\n%s", script)
 	}
 

@@ -83,7 +83,7 @@ func TestMultiFileInitContainer_BareRepoIDViaMirror(t *testing.T) {
 			t.Errorf("useCache=%v: MODEL_SOURCE = %q, want %q", useCache, source, want)
 		}
 		script := strings.Join(downloader.Command, " ") + strings.Join(downloader.Args, " ")
-		if !strings.Contains(script, `-H "Authorization: Bearer ${HF_TOKEN}"`) {
+		if !strings.Contains(script, authHeader) {
 			t.Errorf("useCache=%v: downloader sends no bearer header to the mirror", useCache)
 		}
 	}
