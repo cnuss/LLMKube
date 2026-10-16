@@ -336,6 +336,9 @@ are downloaded from. Other sources need explicit paths.
   `sub/x.safetensors`; write `sub/*.safetensors`).
 - A failed listing fails the Model with reason `RepoListingFailed` and the
   cause, and is retried every minute.
+- A glob turns off `spec.prefetch`: the expansion is written when the Model
+  reconciles, after prefetch would run, so the files stage when the serving
+  pod starts instead.
 - `spec.fileSha256` still needs explicit paths.
 
 Properties worth knowing:
