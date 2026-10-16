@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strings"
 	"testing"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -402,6 +403,8 @@ func TestNextLink(t *testing.T) {
 		{"only prev", []string{`<https://mirror.example/p0>; rel="prev"`}, ""},
 		{"malformed entry skipped", []string{`https://mirror.example/p2; rel="next"`}, ""},
 		{"no params", []string{`<https://mirror.example/p2>`}, ""},
+		{"comma inside the target", []string{`<https://mirror.example/p2?cursor=a,b>; rel="next"`}, "https://mirror.example/p2?cursor=a,b"},
+		{"comma inside a target among several links", []string{`<https://mirror.example/p0?x=1,2>; rel="prev", <https://mirror.example/p2?cursor=a,b>; rel="next"`}, "https://mirror.example/p2?cursor=a,b"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -489,5 +492,30 @@ func TestHFTokenFromSecret(t *testing.T) {
 	}
 	if got := (&ModelReconciler{}).hfTokenFromSecret(context.Background(), model("huggingface")); got != "" {
 		t.Errorf("nil client: hfTokenFromSecret = %q, want empty", got)
+	}
+}
+
+// The page cap bounds requests, not time: a server that answers every page
+// slowly would otherwise hold the reconcile for up to 256 request timeouts.
+// The listing is bounded as a whole.
+func TestListHFRepoFiles_BoundedInTime(t *testing.T) {
+	defer func(d time.Duration) { hfListingTimeout = d }(hfListingTimeout)
+	hfListingTimeout = 200 * time.Millisecond
+
+	var srv *httptest.Server
+	srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(80 * time.Millisecond)
+		w.Header().Set("Link", fmt.Sprintf(`<%s/api/models/org/repo/tree/main?cursor=%s>; rel="next"`, srv.URL, r.URL.Query().Get("cursor")+"x"))
+		_, _ = w.Write([]byte(`[{"type":"file","path":"a.safetensors"}]`))
+	}))
+	defer srv.Close()
+
+	start := time.Now()
+	_, err := listHFRepoFiles(context.Background(), loopbackSafeClient(), srv.URL+"/api/models/org/repo/tree/main?recursive=true", "")
+	if err == nil {
+		t.Fatal("listing finished despite never ending")
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Errorf("listing ran %v, want it cut off near %v", elapsed, hfListingTimeout)
 	}
 }

@@ -202,7 +202,11 @@ func resolveStagedCompanions(isvc *inferencev1alpha1.InferenceService, model *in
 	}
 
 	baseDir := ""
-	if plan, err := modelStagingPlan(model); err == nil && plan != nil && plan.Primary != "" {
+	plan, err := modelStagingPlan(model)
+	if err != nil {
+		llamaCppLog.Info("Cannot resolve the staged file set; companion files are not passed", "model", model.Name, "error", err.Error())
+	}
+	if err == nil && plan != nil && plan.Primary != "" {
 		baseDir = path.Dir(modelPath)
 		if suffix := "/" + plan.Primary; strings.HasSuffix(modelPath, suffix) {
 			baseDir = modelPath[:len(modelPath)-len(suffix)]

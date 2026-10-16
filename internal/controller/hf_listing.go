@@ -25,6 +25,7 @@ import (
 	"net/url"
 	"sort"
 	"strings"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -40,6 +41,9 @@ const (
 	maxHFListingPages = 256
 	maxHFListingBytes = 32 << 20
 )
+
+// hfListingTimeout bounds a whole listing; the page cap bounds only its requests.
+var hfListingTimeout = 2 * time.Minute
 
 // hfListingTreeURL returns the Hub API URL that lists the repository source
 // stages from. It must name the host the init container downloads from (see
@@ -78,7 +82,11 @@ func hfListingTreeURL(source, hfEndpoint string) (string, bool) {
 	if len(segs) != 4 || segs[2] != "resolve" || segs[0] == "" || segs[1] == "" || segs[3] == "" {
 		return "", false
 	}
-	return hfTreeURL(base, segs[0]+"/"+segs[1], segs[3]), true
+	rev, err := url.PathUnescape(segs[3])
+	if err != nil {
+		return "", false
+	}
+	return hfTreeURL(base, segs[0]+"/"+segs[1], url.PathEscape(rev)), true
 }
 
 func hfTreeURL(base, repo, escapedRev string) string {
@@ -89,6 +97,8 @@ func hfTreeURL(base, repo, escapedRev string) string {
 // sorted, following the tree API's Link pagination. A page link must stay on
 // the listing's origin, since the bearer token rides on every page request.
 func listHFRepoFiles(ctx context.Context, client *http.Client, treeURL, token string) ([]string, error) {
+	ctx, cancel := context.WithTimeout(ctx, hfListingTimeout)
+	defer cancel()
 	files := []string{}
 	next := treeURL
 	for page := 0; next != ""; page++ {
@@ -147,25 +157,31 @@ func fetchHFTreePage(ctx context.Context, client *http.Client, pageURL, token st
 }
 
 // nextLink returns the absolute rel="next" target from RFC 8288 Link headers,
-// or "" when there is none.
+// or "" when there is none. Targets are delimited by angle brackets, not
+// commas, since a cursor in the target's query may contain a comma. An
+// unparseable next target fails the listing rather than truncating it.
 func nextLink(headers []string, base *url.URL) (string, error) {
 	for _, h := range headers {
-		for _, part := range strings.Split(h, ",") {
-			target, params, ok := strings.Cut(strings.TrimSpace(part), ";")
-			if !ok || !strings.HasPrefix(target, "<") || !strings.HasSuffix(target, ">") {
+		rest := h
+		for {
+			lt := strings.IndexByte(rest, '<')
+			if lt < 0 {
+				break
+			}
+			gt := strings.IndexByte(rest[lt:], '>')
+			if gt < 0 {
+				break
+			}
+			target := rest[lt+1 : lt+gt]
+			rest = rest[lt+gt+1:]
+			params := rest
+			if i := strings.IndexByte(rest, '<'); i >= 0 {
+				params = rest[:i]
+			}
+			if !linkRelIsNext(params) {
 				continue
 			}
-			isNext := false
-			for _, p := range strings.Split(params, ";") {
-				k, v, _ := strings.Cut(strings.TrimSpace(p), "=")
-				if strings.EqualFold(k, "rel") && strings.Trim(v, `"`) == "next" {
-					isNext = true
-				}
-			}
-			if !isNext {
-				continue
-			}
-			u, err := base.Parse(target[1 : len(target)-1])
+			u, err := base.Parse(target)
 			if err != nil {
 				return "", fmt.Errorf("parse next link: %w", err)
 			}
@@ -173,6 +189,16 @@ func nextLink(headers []string, base *url.URL) (string, error) {
 		}
 	}
 	return "", nil
+}
+
+func linkRelIsNext(params string) bool {
+	for _, p := range strings.Split(params, ";") {
+		k, v, _ := strings.Cut(strings.Trim(strings.TrimSpace(p), ","), "=")
+		if strings.EqualFold(strings.TrimSpace(k), "rel") && strings.Trim(strings.TrimSpace(strings.TrimRight(v, ", ")), `"`) == "next" {
+			return true
+		}
+	}
+	return false
 }
 
 // repoFileListing lists the Model's source repository when spec.files holds a
@@ -195,7 +221,9 @@ func (r *ModelReconciler) repoFileListing(ctx context.Context, model *inferencev
 }
 
 // hfTokenFromSecret returns HF_TOKEN from the Model's sourceSecretRef, or ""
-// when there is none: an ungated repository lists without one.
+// when there is none: an ungated repository lists without one. Trimmed like
+// the metal-agent's read (resolveHFAuth in pkg/agent/s3.go) and
+// hfEndpointFromSecret; keep the three in step.
 func (r *ModelReconciler) hfTokenFromSecret(ctx context.Context, model *inferencev1alpha1.Model) string {
 	if r.Client == nil || model.Spec.SourceSecretRef == nil || model.Spec.SourceSecretRef.Name == "" {
 		return ""
