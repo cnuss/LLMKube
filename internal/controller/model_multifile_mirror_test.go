@@ -5,6 +5,7 @@ import (
 	"strings"
 	"testing"
 
+	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -143,6 +144,9 @@ func newMultiFileGateReconciler(t *testing.T, model *inferencev1alpha1.Model, se
 	scheme := runtime.NewScheme()
 	if err := corev1.AddToScheme(scheme); err != nil {
 		t.Fatalf("add corev1 scheme: %v", err)
+	}
+	if err := batchv1.AddToScheme(scheme); err != nil {
+		t.Fatalf("add batch scheme: %v", err)
 	}
 	if err := inferencev1alpha1.AddToScheme(scheme); err != nil {
 		t.Fatalf("add inference scheme: %v", err)
