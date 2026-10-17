@@ -357,15 +357,18 @@ func addCACertVolume(volumes *[]corev1.Volume, mounts *[]corev1.VolumeMount, cmd
 // The header reaches curl as config on stdin (-K -), not as an argument: a
 // process's arguments are readable from /proc/<pid>/cmdline by anything in its
 // PID namespace, and printf is a shell builtin, so the token is never in any
-// process's argv (#2097). curl's config syntax ends a quoted value at a quote
-// and treats a backslash as an escape, so a token holding either is refused
-// rather than sent altered.
-const hfAuthFn = `hf_curl() { if [ -n "${HF_TOKEN:-}" ]; then case "$HF_TOKEN" in *'"'*|*'\'*) echo "ERROR: HF_TOKEN contains a quote or backslash, which curl config cannot carry" >&2; return 1;; esac; printf 'header = "Authorization: Bearer %s"\n' "$HF_TOKEN" | curl -K - "$@"; else curl "$@"; fi; }` + " && "
+// process's argv (#2097). The command substitution strips the trailing newline
+// a kubectl create secret --from-file Secret keeps, and [![:print:]] refuses
+// any control character still inside the value: curl's config is line-based,
+// ends a quoted value at a quote and treats a backslash as an escape. The
+// never-in-argv guarantee rests on the image's /bin/sh having printf builtin,
+// which ash, dash and bash all do.
+const hfAuthFn = `hf_curl() { if [ -n "${HF_TOKEN:-}" ]; then _llmkube_tok=$(printf '%s' "$HF_TOKEN"); case "$_llmkube_tok" in *'"'*|*'\'*|*[![:print:]]*) echo "ERROR: HF_TOKEN contains a character curl config cannot carry" >&2; return 1;; esac; printf 'header = "Authorization: Bearer %s"\n' "$_llmkube_tok" | curl -K - "$@"; else curl "$@"; fi; }` + " && "
 
 // s3AuthFn defines s3_curl, the helper every S3 transfer goes through. It
 // signs with SigV4 using the spec.sourceSecretRef AWS_* keys, passed to curl
 // as config on stdin for the reason hfAuthFn gives.
-const s3AuthFn = `s3_curl() { case "${AWS_ACCESS_KEY_ID:-}${AWS_SECRET_ACCESS_KEY:-}" in *'"'*|*'\'*) echo "ERROR: AWS_ACCESS_KEY_ID or AWS_SECRET_ACCESS_KEY contains a quote or backslash, which curl config cannot carry" >&2; return 1;; esac; printf 'user = "%s:%s"\n' "${AWS_ACCESS_KEY_ID:-}" "${AWS_SECRET_ACCESS_KEY:-}" | curl --aws-sigv4 "aws:amz:${AWS_REGION}:s3" -K - "$@"; }` + " && "
+const s3AuthFn = `s3_curl() { _llmkube_id=$(printf '%s' "${AWS_ACCESS_KEY_ID:-}"); _llmkube_key=$(printf '%s' "${AWS_SECRET_ACCESS_KEY:-}"); case "${_llmkube_id}${_llmkube_key}" in *'"'*|*'\'*|*[![:print:]]*) echo "ERROR: AWS_ACCESS_KEY_ID or AWS_SECRET_ACCESS_KEY contains a character curl config cannot carry" >&2; return 1;; esac; printf 'user = "%s:%s"\n' "$_llmkube_id" "$_llmkube_key" | curl --aws-sigv4 "aws:amz:${AWS_REGION}:s3" -K - "$@"; }` + " && "
 
 // downloadProgressFn defines download_with_progress, the shell helper every
 // transfer runs under so kubectl logs -c model-downloader shows newline-

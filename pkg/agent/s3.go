@@ -257,14 +257,11 @@ func withCACertPool(base *x509.CertPool, caCerts [][]byte) *x509.CertPool {
 
 // sigv4RoundTripper signs each request to endpoint with AWS Signature Version 4
 // for the s3 service, then delegates to the wrapped transport. This is the
-// in-process equivalent of the init container's
-//
-//	curl --aws-sigv4 "aws:amz:${AWS_REGION}:s3" \
-//	  -u "${AWS_ACCESS_KEY_ID}:${AWS_SECRET_ACCESS_KEY}"
-//
-// and is a faithful copy of the controller's sigv4RoundTripper
-// (internal/controller/model_controller.go); the two share the origin check,
-// safehttp.SameOrigin.
+// in-process equivalent of the init container's s3_curl helper (s3AuthFn in
+// internal/controller/model_storage.go), which passes the AWS keys to curl as
+// config on stdin rather than -u arguments (#2097), and is a faithful copy of
+// the controller's sigv4RoundTripper (internal/controller/model_controller.go);
+// the two share the origin check, safehttp.SameOrigin.
 //
 // A request to any other origin (a redirect the store answered with) passes
 // through unsigned and unmodified. The client runs every redirect hop through
