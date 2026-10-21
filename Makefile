@@ -229,11 +229,12 @@ test-e2e: setup-test-e2e manifests generate fmt vet ## Run the e2e tests. Expect
 cleanup-test-e2e: ## Tear down the Kind cluster used for e2e tests
 	@$(KIND) delete cluster --name $(KIND_CLUSTER)
 
-# A two-worker kind cluster whose workers mount one host directory, so a
-# prefetch Job on one node fills a claim a serving pod on the other reads
-# (test/e2e/multinode_prefetch_e2e_test.go, test/e2e/kind-multinode.yaml).
-# Reuses an existing cluster of the same name like setup-test-e2e does, so
-# run cleanup-test-e2e first when a single-node one is up.
+# A kind cluster for the e2e specs that need more than one node: a control
+# plane and two workers that mount one host directory, one worker labeled as
+# the GPU node (test/e2e/kind-multinode.yaml). test-e2e-multinode runs the
+# "Multi-node" specs on it; today that is the prefetch spec. Reuses an
+# existing cluster of the same name like setup-test-e2e does, so run
+# cleanup-test-e2e first when a single-node one is up.
 E2E_SHARED_CACHE_DIR ?= /tmp/llmkube-e2e-shared-cache
 
 .PHONY: setup-test-e2e-multinode
@@ -253,9 +254,9 @@ setup-test-e2e-multinode: ## Set up a two-worker Kind cluster with a shared host
 	esac
 
 .PHONY: test-e2e-multinode
-test-e2e-multinode: setup-test-e2e-multinode manifests generate fmt vet ## Prefetch on one node and serve from another through a shared claim (needs Kind).
+test-e2e-multinode: setup-test-e2e-multinode manifests generate fmt vet ## Run the e2e specs that need two workers sharing a host directory (needs Kind).
 	LLMKUBE_E2E_MULTINODE=true KIND=$(KIND) KIND_CLUSTER=$(KIND_CLUSTER) go test -timeout 30m -tags=e2e ./test/e2e/ -v -ginkgo.v \
-		-ginkgo.focus='Multi-node prefetch'
+		-ginkgo.focus='Multi-node'
 	$(MAKE) cleanup-test-e2e
 
 # Runs only the "APISIX ai-proxy-multi in front of an InferenceService"

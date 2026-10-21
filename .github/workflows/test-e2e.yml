@@ -147,7 +147,7 @@ jobs:
         run: make cleanup-test-e2e
 
   test-e2e-multinode:
-    name: Run on Ubuntu (kind, two workers, shared cache claim)
+    name: Run on Ubuntu (kind, two workers, shared host directory)
     runs-on: ubuntu-latest
     steps:
       - name: Clone the code
@@ -167,11 +167,12 @@ jobs:
       - name: Verify kind installation
         run: kind version
 
-      # A prefetch Job on the download worker fills a hostPath claim both
-      # workers mount; a serving pod pinned to the "GPU" worker consumes it
-      # read-only with no downloader (#2136). The target creates the
-      # two-worker cluster from test/e2e/kind-multinode.yaml.
-      - name: Running the multi-node prefetch e2e
+      # The specs that need more than one node: the target creates a
+      # control plane and two workers that share one host directory
+      # (test/e2e/kind-multinode.yaml) and runs the "Multi-node" specs on
+      # it. Today that is the prefetch spec: a Job on one worker fills a
+      # hostPath claim both mount, and a pod pinned to the other consumes it.
+      - name: Running the multi-node e2e
         run: |
           go mod tidy
           make test-e2e-multinode

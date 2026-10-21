@@ -1,8 +1,10 @@
 # A control plane and two workers that share one host directory, for the
-# multi-node prefetch e2e (test/e2e/multinode_prefetch_e2e_test.go): the
-# prefetch Job fills a claim from the download worker, and a serving pod
-# pinned to the "GPU" worker reads it. The GPU worker carries the label the
-# docs' off-GPU placement rule keys on; neither worker has a GPU.
+# e2e specs that need more than one node (make test-e2e-multinode). One
+# worker carries the label the docs' off-GPU placement rule keys on, so a
+# spec can keep work off it or pin work to it; neither worker has a GPU.
+# Today the prefetch spec (test/e2e/multinode_prefetch_e2e_test.go) uses it:
+# a Job on the download worker fills a claim, and a pod on the GPU worker
+# reads it.
 #
 # __SHARED_CACHE_DIR__ is replaced by make setup-test-e2e-multinode with
 # E2E_SHARED_CACHE_DIR; the directory must exist on the host first.
