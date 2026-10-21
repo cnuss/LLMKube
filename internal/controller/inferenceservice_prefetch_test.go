@@ -488,9 +488,9 @@ var _ = Describe("InferenceService modelCache.prefetch (#2136)", func() {
 var _ = Describe("buildPrefetchedStorageConfig", func() {
 	multiFileModel := func(generation int64) *inferencev1alpha1.Model {
 		return &inferencev1alpha1.Model{
-			ObjectMeta: metav1.ObjectMeta{Name: "glm", Namespace: "default", Generation: generation},
+			ObjectMeta: metav1.ObjectMeta{Name: "qwen", Namespace: "default", Generation: generation},
 			Spec: inferencev1alpha1.ModelSpec{
-				Source: "hf://org/repo",
+				Source: "hf://Qwen/Qwen2.5-0.5B-Instruct",
 				Format: "safetensors",
 				Files:  []string{"config.json", "*.safetensors"},
 			},
@@ -503,7 +503,7 @@ var _ = Describe("buildPrefetchedStorageConfig", func() {
 	}
 	isvc := &inferencev1alpha1.InferenceService{
 		ObjectMeta: metav1.ObjectMeta{Name: "svc", Namespace: "default"},
-		Spec:       inferencev1alpha1.InferenceServiceSpec{ModelRef: "glm", ModelCache: &inferencev1alpha1.ModelCacheSpec{ClaimName: "svc-cache", Prefetch: true}},
+		Spec:       inferencev1alpha1.InferenceServiceSpec{ModelRef: "qwen", ModelCache: &inferencev1alpha1.ModelCacheSpec{ClaimName: "svc-cache", Prefetch: true}},
 	}
 
 	It("mounts the claim read-only and verifies the staged file set instead of downloading", func() {
