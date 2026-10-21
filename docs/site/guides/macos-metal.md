@@ -37,7 +37,7 @@ running Metal-accelerated InferenceService in about ten minutes.
 - **Homebrew** (or any equivalent way to install `llama.cpp` with
   Metal support).
 - **Xcode Command Line Tools** (`xcode-select --install`, for `git`
-  and `make`) and **Go 1.26.9 or newer** (the version `go.mod` pins),
+  and `make`) and **Go 1.26.10 or newer** (the version `go.mod` pins),
   to build the agent in Step 3.
 
 ## Step 1: Install llama.cpp with Metal

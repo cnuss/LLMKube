@@ -23,7 +23,7 @@ contributors share. The human onboarding narrative lives in
 
 ## Setup
 
-- Go 1.26+ (pinned in `go.mod`).
+- Go 1.26.10+ (pinned in `go.mod`).
 - `make test` downloads envtest binaries on first run; no cluster needed for
   unit tests.
 - `make test-chart` needs `helm` and the `helm-unittest` plugin.
@@ -146,7 +146,7 @@ A change is not done until all of these hold.
   The gate does not regenerate the Helm chart CRDs; run `make chart-crds`
   separately when `api/v1alpha1` types change. If
   staticcheck panics under your Go toolchain, set
-  `LINT_GOTOOLCHAIN=<version>` (for example go1.26.9).
+  `LINT_GOTOOLCHAIN=<version>` (for example go1.26.10).
 - Full suite (what CI and the Foreman gate run): `make test`, random seed and
   coverage profile, unchanged.
 - Editing `scripts/gate.sh`, `scripts/test-affected.sh`,

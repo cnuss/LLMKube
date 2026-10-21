@@ -16,7 +16,7 @@ This directory contains the macOS launchd configuration for the LLMKube Metal Ag
    helm install llmkube llmkube/llmkube \
      -n llmkube-system --create-namespace
    ```
-5. **To build the agent from source:** the Xcode Command Line Tools (`xcode-select --install`) and Go 1.26.9 or newer, the version `go.mod` pins.
+5. **To build the agent from source:** the Xcode Command Line Tools (`xcode-select --install`) and Go 1.26.10 or newer, the version `go.mod` pins.
 6. **`--host-ip` flag** (recommended with a remote cluster): without it the agent auto-detects an address (see "`--host-ip` flag (remote cluster)" below), which may not be one your cluster can reach. Start the agent with `--host-ip <your-mac-ip>` so that its ingress is registered in Kubernetes at an address you chose.
 
 ## Installation

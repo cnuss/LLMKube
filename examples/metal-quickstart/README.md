@@ -38,7 +38,7 @@ The release archive carries it, the plist template and the RBAC manifest under
    ```
 
 4. **To build the agent from source:** the Xcode Command Line Tools
-   (`xcode-select --install`) and Go 1.26.9 or newer (`brew install go`).
+   (`xcode-select --install`) and Go 1.26.10 or newer (`brew install go`).
 
 ## Step 1: Install the LLMKube operator
 
