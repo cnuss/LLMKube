@@ -604,17 +604,8 @@ func (r *InferenceServiceReconciler) constructDeployment(
 	if eb, ok := backend.(EnvBuilder); ok {
 		container.Env = append(container.Env, eb.BuildEnv(isvc)...)
 	}
-	// Env only: llama.cpp takes a file path and never calls the Hub, so
-	// there is no arg to mirror on the metal-agent side. A pod that may not
-	// reach the Hub gets no mirror for it either.
-	if isvc.Spec.Offline {
-		container.Env = append(container.Env,
-			corev1.EnvVar{Name: "HF_HUB_OFFLINE", Value: "1"},
-			corev1.EnvVar{Name: "TRANSFORMERS_OFFLINE", Value: "1"})
-	} else {
-		mirrorEnv, _ := runtimeHFMirrorEnv(backend, isvc, model, hfEndpoint)
-		container.Env = append(container.Env, mirrorEnv...)
-	}
+	mirrorEnv, _ := runtimeHFMirrorEnv(backend, isvc, model, hfEndpoint)
+	container.Env = append(container.Env, mirrorEnv...)
 	if len(isvc.Spec.Env) > 0 {
 		container.Env = append(container.Env, isvc.Spec.Env...)
 	}

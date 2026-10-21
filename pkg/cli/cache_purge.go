@@ -119,10 +119,13 @@ type purgeTarget struct {
 // the shared claim, which a shared-mode service may hold under RWO. The
 // claims of services that do not reference the model stay untouched, so
 // clearing one model does not create a read-write pod on every running
-// service's volume or fail on their attach timeouts. all is every cache claim
-// in the namespace, in the order cachePVCandidates returns.
+// service's volume or fail on their attach timeouts. stagedClaims are the
+// claims the Model's status.prefetch records: the controller's sticky target
+// keeps a claim the services, or an explicit claimName, have since moved away
+// from, and the files are there too. all is every cache claim in the
+// namespace, in the order cachePVCandidates returns.
 func targetedClaims(
-	all []purgeTarget, svcs []inferencev1alpha1.InferenceService, modelName, modelClaim string,
+	all []purgeTarget, svcs []inferencev1alpha1.InferenceService, modelName, modelClaim string, stagedClaims []string,
 ) []purgeTarget {
 	exists := make(map[string]bool, len(all))
 	for _, target := range all {
@@ -134,6 +137,12 @@ func targetedClaims(
 	if modelClaim != "" {
 		own[modelClaim] = true
 		consulted = true
+	}
+	for _, claim := range stagedClaims {
+		if claim != "" {
+			own[claim] = true
+			consulted = true
+		}
 	}
 	for i := range svcs {
 		svc := &svcs[i]
@@ -600,14 +609,25 @@ func modelCacheClaimName(model *inferencev1alpha1.Model) string {
 	return model.Spec.ModelCache.ClaimName
 }
 
-// modelOwnCacheClaim returns the claim the named Model declares with
-// spec.modelCache.claimName, or "" when it declares none or does not exist.
-func modelOwnCacheClaim(ctx context.Context, k8sClient client.Client, namespace, name string) string {
+// modelCacheClaims returns the claim the named Model declares with
+// spec.modelCache.claimName and the claims its status.prefetch records; both
+// empty when the Model does not exist.
+func modelCacheClaims(ctx context.Context, k8sClient client.Client, namespace, name string) (string, []string) {
 	model := &inferencev1alpha1.Model{}
 	if err := k8sClient.Get(ctx, client.ObjectKey{Name: name, Namespace: namespace}, model); err != nil {
-		return ""
+		return "", nil
 	}
-	return modelCacheClaimName(model)
+	return modelCacheClaimName(model), prefetchedClaims(model)
+}
+
+// prefetchedClaims lists the claims Model.status.prefetch records a staging
+// into, in status order.
+func prefetchedClaims(model *inferencev1alpha1.Model) []string {
+	claims := make([]string, 0, len(model.Status.Prefetch))
+	for _, e := range model.Status.Prefetch {
+		claims = append(claims, e.ClaimName)
+	}
+	return claims
 }
 
 // userModelCacheClaimName mirrors the controller's helper: the claim a service

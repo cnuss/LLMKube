@@ -321,6 +321,69 @@ func TestRunDelete_PurgeTargetsClaimDeclaredOnModel(t *testing.T) {
 	}
 }
 
+// TestRunDelete_PurgeTargetsClaimsStatusPrefetchRecords: the controller's
+// sticky target staged the Model into the shared cache before the service
+// moved to its own claim, so the files are on both and both are purged.
+func TestRunDelete_PurgeTargetsClaimsStatusPrefetchRecords(t *testing.T) {
+	const (
+		namespace = "default"
+		modelName = "qwen"
+	)
+	key := cachekey.Compute("hf://org/qwen")
+
+	model := &inferencev1alpha1.Model{
+		ObjectMeta: metav1.ObjectMeta{Name: modelName, Namespace: namespace},
+		Spec:       inferencev1alpha1.ModelSpec{Source: "hf://org/qwen", Files: []string{"model.gguf"}},
+		Status: inferencev1alpha1.ModelStatus{Prefetch: []inferencev1alpha1.PrefetchStatus{
+			{ClaimName: modelCachePVCName, Own: true, Phase: inferencev1alpha1.PrefetchPhaseSucceeded},
+		}},
+	}
+	isvc := &inferencev1alpha1.InferenceService{
+		ObjectMeta: metav1.ObjectMeta{Name: "chat-api", Namespace: namespace},
+		Spec: inferencev1alpha1.InferenceServiceSpec{
+			ModelRef:   modelName,
+			ModelCache: &inferencev1alpha1.ModelCacheSpec{ClaimName: "moved-claim"},
+		},
+	}
+	shared := &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      modelCachePVCName,
+			Namespace: namespace,
+			Labels:    map[string]string{modelCacheLabel: modelCacheLabelValue},
+		},
+	}
+	moved := &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{Name: "moved-claim", Namespace: namespace},
+	}
+
+	crClient := fake.NewClientBuilder().WithScheme(newCLIScheme()).WithObjects(model, isvc, shared, moved).Build()
+	clientset := fakeclientset.NewClientset()
+	stubDeleteSeams(t, crClient, clientset)
+
+	var cmds [][]string
+	fakePurgeExec(t, func(command []string) (string, error) {
+		if len(command) < 3 || command[1] != "-c" {
+			return "", nil
+		}
+		return "removed /models/" + key + "\n", nil
+	}, &cmds)
+
+	if err := runDelete(&deleteOptions{name: modelName, namespace: namespace, purgeCache: true}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	purged := map[string]bool{}
+	for _, action := range clientset.Actions() {
+		if action.GetVerb() == "create" && action.GetResource().Resource == "pods" {
+			purged[action.(k8stesting.CreateAction).GetObject().(*corev1.Pod).Name] = true
+		}
+	}
+	if len(purged) != 2 || !purged[purgePodName(modelCachePVCName)] || !purged[purgePodName("moved-claim")] {
+		t.Errorf("purge pods = %v, want one on %s (status.prefetch) and one on moved-claim (the service)",
+			purged, modelCachePVCName)
+	}
+}
+
 // TestRunDelete_SkipsClaimCollectedWithService pins perService mode: the
 // per-service claim is owner-ref'd to the InferenceService, so garbage
 // collection removes it, and a pod mounting a terminating claim never

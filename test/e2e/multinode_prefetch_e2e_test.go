@@ -243,7 +243,7 @@ spec:
 	})
 
 	It("stages on the download worker and serves from the GPU worker with no downloader", func() {
-		By("applying a Model that prefetches into the shared claim off the GPU worker, and a service that waits for it")
+		By("applying a Model that names the shared claim and places its prefetch off the GPU worker, and a service that asks for the staging and waits for it")
 		apply(fmt.Sprintf(`apiVersion: inference.llmkube.dev/v1alpha1
 kind: Model
 metadata:
@@ -251,7 +251,6 @@ metadata:
   namespace: %[2]s
 spec:
   source: "%[3]s"
-  prefetch: true
   modelCache:
     claimName: %[4]s
   prefetchAffinity:
@@ -288,7 +287,13 @@ spec:
 		Expect(phase).To(Equal("Ready"))
 
 		By("checking the Job's pod ran on the download worker")
-		jobName := multinodeModel + "-prefetch"
+		// The Model does not prefetch itself, so the only target is the one
+		// the service asked for: a claim-scoped Job, which proves the gate
+		// and not the Model's own Ready.
+		jobName, err := kubectl("get", "model", multinodeModel, "-n", multinodeTestNs, "-o",
+			fmt.Sprintf(`jsonpath={.status.prefetch[?(@.claimName=="%s")].jobName}`, multinodeSharedClaim))
+		Expect(err).NotTo(HaveOccurred())
+		Expect(jobName).To(HavePrefix(multinodeModel+"-prefetch-"), "a service-requested target gets a claim-scoped Job")
 		jobNode, err := kubectl("get", "pods", "-n", multinodeTestNs, "-l", "batch.kubernetes.io/job-name="+jobName,
 			"-o", "jsonpath={.items[*].spec.nodeName}")
 		Expect(err).NotTo(HaveOccurred())

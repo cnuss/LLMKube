@@ -255,6 +255,9 @@ setup-test-e2e-multinode: ## Set up a two-worker Kind cluster with a shared host
 
 .PHONY: test-e2e-multinode
 test-e2e-multinode: setup-test-e2e-multinode manifests generate fmt vet ## Run the e2e specs that need two workers sharing a host directory (needs Kind).
+	@# A rerun must stage afresh, not verify the previous run's bytes.
+	@test -n "$(E2E_SHARED_CACHE_DIR)" && test "$(E2E_SHARED_CACHE_DIR)" != "/" || { echo "refusing to empty E2E_SHARED_CACHE_DIR='$(E2E_SHARED_CACHE_DIR)'"; exit 1; }
+	@find "$(E2E_SHARED_CACHE_DIR)" -mindepth 1 -maxdepth 1 -exec rm -rf {} +
 	LLMKUBE_E2E_MULTINODE=true KIND=$(KIND) KIND_CLUSTER=$(KIND_CLUSTER) go test -timeout 30m -tags=e2e ./test/e2e/ -v -ginkgo.v \
 		-ginkgo.focus='Multi-node'
 	$(MAKE) cleanup-test-e2e

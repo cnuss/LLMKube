@@ -839,6 +839,17 @@ func singleFileStagedBasename(model *inferencev1alpha1.Model) string {
 	return canonicalModelBasename(model)
 }
 
+// prefetchStagedFileNames is stagedFileNamesFromPlan for a Model whose plan
+// is resolved here, with that plan; an unresolvable plan yields the
+// single-file name and a nil plan.
+func prefetchStagedFileNames(model *inferencev1alpha1.Model) ([]string, *StagingPlan) {
+	plan, err := modelStagingPlan(model)
+	if err != nil {
+		plan = nil
+	}
+	return stagedFileNamesFromPlan(model, plan), plan
+}
+
 // stagedFileNamesFromPlan lists the cache-relative names a Model's files are
 // staged under, primary first: the plan's files for a multi-file Model, or
 // the single-file basename. plan is modelStagingPlan's result, nil for a
@@ -2153,7 +2164,7 @@ func buildPrefetchedStorageConfig(model *inferencev1alpha1.Model, isvc *inferenc
 func buildPrefetchVerifyCommand(verifyDigest bool) string {
 	cmd := `printf '%s\n' "$MODEL_FILES" | while IFS= read -r rel; do ` +
 		`[ -n "$rel" ] || continue; ` +
-		`if [ ! -f "$CACHE_DIR/$rel" ]; then ` +
+		`if [ ! -f "$CACHE_DIR/$rel" ] || [ ! -r "$CACHE_DIR/$rel" ]; then ` +
 		`printf 'ERROR: PrefetchedFilesMissing - %s is not on the cache claim. Model %s was expected to be staged there by its prefetch job (see the Model status.prefetch); not downloading on the serving node.\n' "$CACHE_DIR/$rel" "$MODEL_NAME" >&2; ` +
 		`exit 1; fi; done || exit 1; `
 	if verifyDigest {

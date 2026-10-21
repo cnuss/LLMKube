@@ -100,6 +100,10 @@ const (
 	ReasonSourceNotPrefetchable = "SourceNotPrefetchable"
 	ReasonPrefetchClaimMismatch = "ClaimMismatch"
 	ReasonPrefetchClaimNotFound = "PrefetchClaimNotFound"
+	// ReasonPrefetchListingFailed: the InferenceService listing failed and no
+	// own target is on record, so the Model holds rather than guess the
+	// shared cache.
+	ReasonPrefetchListingFailed = "PrefetchListingFailed"
 	ReasonPrefetchStarted       = "PrefetchStarted"
 	ReasonPrefetchRunning       = "PrefetchRunning"
 	ReasonPrefetchFailed        = "PrefetchFailed"
@@ -164,7 +168,10 @@ func prefetchTargetJobName(model *inferencev1alpha1.Model, claim string) string 
 // part so the Job name fits the pod label the Job controller derives from it.
 func prefetchJobNameFor(modelName, suffix string) string {
 	if room := maxPrefetchJobNameLength - len(suffix); len(modelName) > room {
-		modelName = strings.TrimRight(modelName[:room], "-.")
+		// Names that share their kept prefix must not share a Job.
+		sum := sha256.Sum256([]byte(modelName))
+		tag := "-" + hex.EncodeToString(sum[:])[:6]
+		modelName = strings.TrimRight(modelName[:room-len(tag)], "-.") + tag
 	}
 	return modelName + suffix
 }
@@ -179,6 +186,17 @@ func prefetchJobNameInUse(model *inferencev1alpha1.Model, name, claim string) bo
 		}
 	}
 	return false
+}
+
+// inFlightOwnClaim returns the claim of the Model's own target on record in
+// any phase, or "".
+func inFlightOwnClaim(model *inferencev1alpha1.Model) string {
+	for _, e := range model.Status.Prefetch {
+		if e.Own {
+			return e.ClaimName
+		}
+	}
+	return ""
 }
 
 // stagedClaimFor returns the Model's own target claim already staged for
@@ -257,7 +275,9 @@ func (r *ModelReconciler) prefetchTargets(model *inferencev1alpha1.Model, servic
 	if modelWantsPrefetch(model) {
 		var claim string
 		claim, ownReason = resolveOwnPrefetchClaim(model, services, listErr, stagedClaim)
-		add(claim, true, "")
+		if claim != "" {
+			add(claim, true, "")
+		}
 	}
 	for _, svc := range services {
 		if !servicePrefetchRequested(svc) {
@@ -294,10 +314,15 @@ func resolveOwnPrefetchClaim(model *inferencev1alpha1.Model, services []*inferen
 		return stagedClaim, ""
 	}
 	if listErr != nil {
-		// A listing failure (RBAC denial, partitioned API server) must not
-		// wedge prefetch: fall back to the shared cache, which is the
-		// pre-#1676 behaviour, and let the caller surface the ignore.
-		return ModelCachePVCName, "prefetch cache listing failed: " + listErr.Error()
+		// Without the listing the agreed claim is unknown. A target already
+		// on record stays: falling back to the shared cache here would start
+		// a second own Job, and a cache hit there would finish first and pin
+		// the own target to the shared cache (#2136 again). With nothing on
+		// record the caller holds until the listing works.
+		if c := inFlightOwnClaim(model); c != "" {
+			return c, ""
+		}
+		return "", "prefetch cache listing failed and no target is on record: " + listErr.Error()
 	}
 	var (
 		seen     bool
@@ -537,6 +562,12 @@ func (r *ModelReconciler) reconcilePrefetchState(ctx context.Context, model *inf
 			ownClaim = t.claim
 		}
 	}
+	if wantsOwn && ownClaim == "" {
+		// No own target this pass: the listing failed with nothing on record.
+		model.Status.Phase = "Pending"
+		setCondition(model, ConditionProgressing, metav1.ConditionFalse, ReasonPrefetchListingFailed, ownReason)
+		return true, ctrl.Result{RequeueAfter: earliestPositive(requeue, prefetchClaimWait)}, nil
+	}
 	if listErr != nil {
 		// The service requests are unknown this pass, so nothing is pruned
 		// and no mismatch is judged; the Jobs they drive stay.
@@ -750,6 +781,11 @@ func (r *ModelReconciler) reconcilePrefetchTarget(ctx context.Context, model, jo
 	entry.JobName = job.Name
 	entry.Fingerprint = fingerprint
 	entry.ObservedGeneration = model.Generation
+	if len(entry.Files) == 0 {
+		// Adopted from a controller that recorded no names: consumers verify
+		// what the plan says this Job wrote.
+		entry.Files, _ = prefetchStagedFileNames(jobModel)
+	}
 	switch {
 	case jobSucceeded(job):
 		// A re-verification that passed is a new staging of the same files:
@@ -803,6 +839,17 @@ func (r *ModelReconciler) reconcilePrefetchTarget(ctx context.Context, model, jo
 	}
 }
 
+// prefetchSharedCacheClass is the class the shared claim gets when the Job
+// creates it: the Model's modelCache.storageClassName, which its services
+// inherit, else the operator's, as ensureModelCachePVC resolves it on the
+// service side. An existing claim keeps its class.
+func prefetchSharedCacheClass(model *inferencev1alpha1.Model, operatorClass string) string {
+	if model.Spec.ModelCache != nil && model.Spec.ModelCache.StorageClassName != "" {
+		return model.Spec.ModelCache.StorageClassName
+	}
+	return operatorClass
+}
+
 // restageRequested reports whether a service consuming claim says its pods
 // found the staged files missing, which is a request to stage again.
 func (r *ModelReconciler) restageRequested(services []*inferencev1alpha1.InferenceService, claim string) bool {
@@ -841,18 +888,24 @@ func (r *ModelReconciler) singleWriterClaimHolder(ctx context.Context, namespace
 	if err := r.List(ctx, pods, client.InNamespace(namespace)); err != nil {
 		return "", ""
 	}
+	// The first holder by name, not by cache order, so the message is the
+	// same every pass.
+	holder := ""
 	for i := range pods.Items {
 		pod := &pods.Items[i]
 		if pod.Status.Phase == corev1.PodSucceeded || pod.Status.Phase == corev1.PodFailed {
 			continue
 		}
 		for _, v := range pod.Spec.Volumes {
-			if v.PersistentVolumeClaim != nil && v.PersistentVolumeClaim.ClaimName == claim {
-				return pod.Name, mode
+			if v.PersistentVolumeClaim != nil && v.PersistentVolumeClaim.ClaimName == claim && (holder == "" || pod.Name < holder) {
+				holder = pod.Name
 			}
 		}
 	}
-	return "", ""
+	if holder == "" {
+		return "", ""
+	}
+	return holder, mode
 }
 
 // prefetchJobBlocked reports a Job pod that is Pending and cannot be
@@ -894,8 +947,10 @@ func (r *ModelReconciler) prefetchJobBlocked(ctx context.Context, job *batchv1.J
 				break
 			}
 		}
-		detail := fmt.Sprintf("pod %q has been Pending on node %q for %s after scheduling; %s",
-			pod.Name, pod.Spec.NodeName, time.Since(pod.CreationTimestamp.Time).Round(time.Second), waiting)
+		// No elapsed time: the message is written to status and sent as an
+		// event only when it changes.
+		detail := fmt.Sprintf("pod %q has been Pending on node %q since %s; %s",
+			pod.Name, pod.Spec.NodeName, pod.CreationTimestamp.UTC().Format(time.RFC3339), waiting)
 		if strings.Contains(waiting, "Multi-Attach") {
 			detail += ". The claim is attached on another node: suspend the consuming service (spec.suspend) to release it, or use a ReadWriteMany claim"
 		}
@@ -911,7 +966,7 @@ func (r *ModelReconciler) startPrefetchTarget(ctx context.Context, model, jobMod
 
 	if t.claim == ModelCachePVCName {
 		if err := ensureSharedModelCachePVC(ctx, r.Client, model.Namespace,
-			r.ModelCacheSize, r.ModelCacheClass, r.ModelCacheAccessMode); err != nil {
+			r.ModelCacheSize, prefetchSharedCacheClass(model, r.ModelCacheClass), r.ModelCacheAccessMode); err != nil {
 			return prefetchTargetOutcome{}, fmt.Errorf("ensuring shared model cache PVC: %w", err)
 		}
 	} else {
@@ -936,11 +991,7 @@ func (r *ModelReconciler) startPrefetchTarget(ctx context.Context, model, jobMod
 	// storage builder reads the basename of Status.Path); a plan whose
 	// names differ writes new files, which is a fresh staging consumers
 	// wait for, not a check of what they already have.
-	plan, planErr := modelStagingPlan(jobModel)
-	if planErr != nil {
-		plan = nil
-	}
-	names := stagedFileNamesFromPlan(jobModel, plan)
+	names, plan := prefetchStagedFileNames(jobModel)
 	if reverify && len(entry.Files) > 0 && !slices.Equal(names, entry.Files) {
 		if plan == nil && len(entry.Files) == 1 {
 			jobModel.Status.Path = entry.Files[0]
@@ -1117,6 +1168,7 @@ func (r *ModelReconciler) setPrefetchTargetMismatch(model *inferencev1alpha1.Mod
 		meta.RemoveStatusCondition(&model.Status.Conditions, ConditionPrefetchTargetMismatch)
 		return
 	}
+	sort.Strings(mismatched)
 	meta.SetStatusCondition(&model.Status.Conditions, metav1.Condition{
 		Type:               ConditionPrefetchTargetMismatch,
 		Status:             metav1.ConditionTrue,

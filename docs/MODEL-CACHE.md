@@ -288,19 +288,20 @@ With the field set:
   later change that needs new weights holds the same way: the live
   Deployment keeps serving the old template until the new prefetch
   completes, then rolls. A failed prefetch shows as `PrefetchFailed` and the
-  workload stays as it was; delete the Job to retry.
+  workload stays as it was; delete the Job to retry. While a hold is on, a
+  replica change other than to zero waits with the template, and a
+  `multiNode` group that loses a member is recreated only once the
+  prefetch finishes.
 - Once staged, the serving pods only consume the cache: the claim is
   mounted read-only, there is no `model-cache-prep` or `model-downloader`
   init container, and a `model-verify` init container checks the files the
   Job recorded on the entry are present (and hashes a single file against
   `spec.sha256` when one is pinned). If a file is missing the pod fails with
   `PrefetchedFilesMissing` (surfaced on the `ModelTransferHealthy`
-  condition) rather than downloading on the serving node. Add `spec.offline: true`
-  when the runtime must not reach the Hub for anything the Job did not
-  stage: the pods then get `HF_HUB_OFFLINE=1` and `TRANSFORMERS_OFFLINE=1`
-  and fail at once on such a lookup. The field needs the operator to stage
-  the model; on a runtime that downloads the Model itself the service gets
-  an `OfflineRuntimeDownload` warning instead.
+  condition) rather than downloading on the serving node. The prefetch sets
+  no Hub-offline variable: put `HF_HUB_OFFLINE=1` in `spec.env` when the
+  runtime must not reach the Hub for anything the Job did not stage (see
+  the air-gapped guide).
 - Use a `ReadWriteMany` (or `ReadOnlyMany`) claim when the serving pods run
   on other nodes than the Job. A `ReadWriteOnce` claim attaches to one node:
   the first staging works because the Job finishes before the pods attach,

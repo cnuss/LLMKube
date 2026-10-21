@@ -564,13 +564,17 @@ func TestResolvePurgeTargets_InheritsOnlyTheReferencedModelsClaim(t *testing.T) 
 		}
 		return p
 	}
-	model := func(name, claim string) *inferencev1alpha1.Model {
+	model := func(name, claim string, staged ...string) *inferencev1alpha1.Model {
 		m := &inferencev1alpha1.Model{
 			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
 			Spec:       inferencev1alpha1.ModelSpec{Source: "hf://org/" + name},
 		}
 		if claim != "" {
 			m.Spec.ModelCache = &inferencev1alpha1.ModelCacheSpec{ClaimName: claim}
+		}
+		for _, c := range staged {
+			m.Status.Prefetch = append(m.Status.Prefetch,
+				inferencev1alpha1.PrefetchStatus{ClaimName: c, Phase: inferencev1alpha1.PrefetchPhaseSucceeded})
 		}
 		return m
 	}
@@ -582,7 +586,7 @@ func TestResolvePurgeTargets_InheritsOnlyTheReferencedModelsClaim(t *testing.T) 
 	}
 	k8sClient := fake.NewClientBuilder().WithScheme(newCLIScheme()).WithObjects(
 		pvc(modelCachePVCName, true), pvc("other-claim", false), pvc("qwen-claim", false),
-		model("other", "other-claim"), model("qwen", "qwen-claim"),
+		model("other", "other-claim"), model("qwen", "qwen-claim", modelCachePVCName),
 		svc("qwen", "other"), svc("svc-a", "qwen"),
 	).Build()
 	ctx := context.Background()
@@ -598,7 +602,14 @@ func TestResolvePurgeTargets_InheritsOnlyTheReferencedModelsClaim(t *testing.T) 
 		}
 		return out
 	}
-	forQwen := names(targetedClaims(targets, svcs, "qwen", modelOwnCacheClaim(ctx, k8sClient, ns, "qwen")))
+	qwenClaim, qwenStaged := modelCacheClaims(ctx, k8sClient, ns, "qwen")
+	if !slices.Equal(qwenStaged, []string{modelCachePVCName}) {
+		t.Errorf("modelCacheClaims staged = %v, want the status.prefetch claim %s", qwenStaged, modelCachePVCName)
+	}
+	forQwen := names(targetedClaims(targets, svcs, "qwen", qwenClaim, qwenStaged))
+	if !slices.Contains(forQwen, modelCachePVCName) {
+		t.Errorf("clearing qwen targets %v, want %s too: status.prefetch records a staging there", forQwen, modelCachePVCName)
+	}
 	if slices.Contains(forQwen, "other-claim") {
 		t.Errorf("clearing qwen targets %v: other-claim belongs to Model other, "+
 			"which service qwen references but model qwen does not own", forQwen)
@@ -607,7 +618,8 @@ func TestResolvePurgeTargets_InheritsOnlyTheReferencedModelsClaim(t *testing.T) 
 		t.Errorf("clearing qwen targets %v, want qwen-claim: "+
 			"svc-a references qwen with no block and inherits its claim", forQwen)
 	}
-	forOther := names(targetedClaims(targets, svcs, "other", modelOwnCacheClaim(ctx, k8sClient, ns, "other")))
+	otherClaim, otherStaged := modelCacheClaims(ctx, k8sClient, ns, "other")
+	forOther := names(targetedClaims(targets, svcs, "other", otherClaim, otherStaged))
 	if !slices.Contains(forOther, "other-claim") || slices.Contains(forOther, "qwen-claim") {
 		t.Errorf("clearing other targets %v, want other-claim and not qwen-claim", forOther)
 	}
@@ -719,8 +731,20 @@ func TestTargetedClaims(t *testing.T) {
 		svcs       []inferencev1alpha1.InferenceService
 		model      string
 		modelClaim string
+		staged     []string
 		want       []string
 	}{
+		{
+			// The controller's sticky target: the Model staged into the shared
+			// cache before the service and its claim appeared, and keeps
+			// staging there, so the files are on both.
+			name:   "the claims status.prefetch records are targets beside the service's",
+			all:    []purgeTarget{shared, overrideClaim, unrelatedPerService},
+			svcs:   []inferencev1alpha1.InferenceService{svc("qwen", "qwen", "isvc-cache")},
+			model:  "qwen",
+			staged: []string{"llmkube-model-cache"},
+			want:   []string{"llmkube-model-cache", "isvc-cache"},
+		},
 		{
 			// #2136: the Model names the claim and the service inherits it;
 			// the service's own spec says nothing.
@@ -827,7 +851,7 @@ func TestTargetedClaims(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := targetedClaims(tt.all, tt.svcs, tt.model, tt.modelClaim)
+			got := targetedClaims(tt.all, tt.svcs, tt.model, tt.modelClaim, tt.staged)
 			var names []string
 			for _, target := range got {
 				names = append(names, target.Name)

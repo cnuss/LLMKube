@@ -265,7 +265,7 @@ var _ = Describe("InferenceService modelCache.prefetch (#2136)", func() {
 		Expect(cond.Status).To(Equal(metav1.ConditionTrue))
 		Expect(cond.Reason).To(Equal(ReasonPrefetchComplete))
 		Expect(got.Status.SchedulingStatus).To(BeEmpty(), "the hold's diagnosis is cleared when the gate opens")
-		Expect(envValue(pod.Containers[0].Env, "HF_HUB_OFFLINE")).To(BeEmpty(), "prefetch alone does not take the runtime offline; spec.offline does")
+		Expect(envValue(pod.Containers[0].Env, "HF_HUB_OFFLINE")).To(BeEmpty(), "prefetch stamps no Hub-offline env; that stays the user's spec.env")
 		Expect(findPrefetchStatus(model, "svc-cache").Files).To(Equal([]string{canonicalModelBasename(model)}), "the Job records what it wrote")
 		hash1 := dep.Annotations[AnnotationDesiredTemplateHash]
 		Expect(hash1).NotTo(BeEmpty())
@@ -487,22 +487,6 @@ var _ = Describe("InferenceService modelCache.prefetch (#2136)", func() {
 		Expect(cond).NotTo(BeNil())
 		Expect(cond.Status).To(Equal(metav1.ConditionFalse))
 		Expect(cond.Reason).To(Equal(ReasonWaitingForModel))
-	})
-
-	It("warns when spec.offline cuts off a runtime that downloads its own Model", func() {
-		model := readyModel("offline-tgi-model", "example-org/offline-repo", nil)
-		isvc := newService("offline-tgi", model.Name, nil)
-		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: isvc.Name, Namespace: ns}, isvc)).To(Succeed())
-		isvc.Spec.Runtime = "tgi"
-		isvc.Spec.Offline = true
-		Expect(k8sClient.Update(ctx, isvc)).To(Succeed())
-
-		r := isvcReconciler()
-		recorder := events.NewFakeRecorder(50)
-		r.Recorder = recorder
-		reconcileService(r, isvc.Name)
-		Expect(drainEvents(recorder)).To(ContainElement(HavePrefix("Warning "+ReasonOfflineRuntimeDownload)),
-			"TGI fetches the repo itself, which HF_HUB_OFFLINE=1 refuses; the pod would crash-loop with only its log saying why")
 	})
 
 	It("rejects modelCache.prefetch with persistence Ephemeral at admission", func() {

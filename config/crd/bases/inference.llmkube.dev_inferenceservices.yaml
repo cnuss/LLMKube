@@ -3787,10 +3787,14 @@ spec:
                       Model stage itself into its own modelCache.claimName.
 
                       Cannot be set with persistence Ephemeral: an emptyDir cannot be
-                      prefetched. Reported as PrefetchNotApplicable, and not waited for, when
-                      the source is one the downloader does not stage (pvc://, oci://, local
-                      paths, s3://), on Metal (no cache claim is mounted), or when model
-                      caching is disabled on the operator.
+                      prefetched. Reported as PrefetchNotApplicable, and not waited for, only
+                      where nothing downloads at serve time: Metal (no cache claim is
+                      mounted) and pre-staged sources (pvc://, oci://, local paths). A
+                      request the pods could not consume is refused and held as
+                      PrefetchUnsupported: model caching disabled on the operator, a runtime
+                      the operator does not stage, a speculativeDecoding draft model, a
+                      multiNode member with its own modelCache.claimName, or a source the
+                      downloader does not stage ahead of time (s3://).
                     type: boolean
                   storageClassName:
                     description: |-
@@ -3954,19 +3958,6 @@ spec:
                   type: string
                 description: NodeSelector for pod placement (e.g., specific node pools)
                 type: object
-              offline:
-                description: |-
-                  Offline keeps the serving runtime off the Hugging Face Hub: the pods
-                  get HF_HUB_OFFLINE=1 and TRANSFORMERS_OFFLINE=1, so a lookup the
-                  operator did not stage (a tokenizer in another repository, remote
-                  code) fails at once instead of downloading on the serving node. Pair
-                  it with modelCache.prefetch or a pvc:// source in air-gapped
-                  clusters. It needs the operator to stage the model (or a pvc://
-                  source): a runtime that downloads the Model itself (skipModelInit,
-                  TGI, generic without stageModel) fails at start, and the service
-                  gets an OfflineRuntimeDownload warning. llama.cpp reads a file path
-                  and ignores both. An explicit spec.env entry with the same name wins.
-                type: boolean
               pagedSSDCacheDir:
                 description: |-
                   PagedSSDCacheDir sets the directory for the oMLX paged SSD cache.

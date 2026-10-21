@@ -55,9 +55,10 @@ const (
 	// ReasonWaitingForModel: the Model has not derived what the prefetch
 	// needs (its cache key) yet; the workload is held as Pending, not failed.
 	ReasonWaitingForModel = "WaitingForModel"
-	// ReasonPrefetchNotApplicable: the service asked, but there is no cache
-	// path to stage into (Metal, caching disabled, a pre-staged source); the
-	// workload proceeds as if the field were unset.
+	// ReasonPrefetchNotApplicable: the service asked, but nothing downloads
+	// at serve time (Metal, a pre-staged source); the workload proceeds as if
+	// the field were unset. Caching disabled on the operator is
+	// PrefetchUnsupported: the pods would download into an emptyDir.
 	ReasonPrefetchNotApplicable = "PrefetchNotApplicable"
 	// ReasonPrefetchTargetMismatch is the event a service gets when its Model
 	// was prefetched, but not into the claim this service mounts.
@@ -180,6 +181,12 @@ func setModelPrefetchedCondition(isvc *inferencev1alpha1.InferenceService, g pre
 // way and shows on the service; it never rolls pods onto a cache that was
 // not filled. A workload scaled to zero is not held: there is nothing to
 // protect and the scale-down must land.
+//
+// Two gaps while a hold is on. A replica change other than to zero waits
+// with the template. A multiNode group is returned with its last counts and
+// not reconciled, so a member lost to an eviction or a drain is recreated
+// only once the prefetch finishes; the Deployment path heals through its
+// ReplicaSet meanwhile.
 func (r *InferenceServiceReconciler) holdForPrefetch(ctx context.Context, isvc *inferencev1alpha1.InferenceService, model *inferencev1alpha1.Model, desiredReplicas int32, modelReady bool) (held bool, dep *appsv1.Deployment, counts replicaCounts, result *ctrl.Result, err error) {
 	g := r.prefetchGate(isvc, model)
 	setModelPrefetchedCondition(isvc, g)

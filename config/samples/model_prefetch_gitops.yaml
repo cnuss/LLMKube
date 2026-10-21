@@ -23,9 +23,6 @@
 #   status.prefetch entry says why, and deleting the Job retries it.
 # - Progress is in the Model's status.prefetch (one entry per claim) and in
 #   the service's ModelPrefetched condition.
-# - offline: true keeps the runtime off the Hub for anything the Job did not
-#   stage (a tokenizer in another repository, remote code): such a lookup
-#   fails at once instead of downloading on the GPU node.
 apiVersion: inference.llmkube.dev/v1alpha1
 kind: Model
 metadata:
@@ -60,4 +57,3 @@ spec:
   modelCache:
     claimName: model-cache
     prefetch: true
-  offline: true

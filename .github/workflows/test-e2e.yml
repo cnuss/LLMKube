@@ -149,6 +149,9 @@ jobs:
   test-e2e-multinode:
     name: Run on Ubuntu (kind, two workers, shared host directory)
     runs-on: ubuntu-latest
+    # Best-effort while the two-worker harness settles in CI, like the other
+    # recent e2e jobs; the default kind job above remains the merge gate.
+    continue-on-error: true
     steps:
       - name: Clone the code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

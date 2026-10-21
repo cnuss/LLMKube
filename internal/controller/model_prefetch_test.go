@@ -629,6 +629,114 @@ var _ = Describe("Model Prefetch", func() {
 			Expect(findPrefetchStatus(model, "svc-cache-lf")).NotTo(BeNil())
 		})
 
+		// Without the listing the agreed claim is unknown: a target on record
+		// stays, and a Model with none holds. Falling back to the shared cache
+		// would start a second own Job there, which a cache hit finishes
+		// first, pinning the own target to the shared cache.
+		It("keeps the own target on record through a listing failure, and holds without one", func() {
+			createPVC("node-b-lf")
+			model := newPrefetchModel("model-prefetch-lf-own")
+			Expect(k8sClient.Create(ctx, model)).To(Succeed())
+			defer func() { _ = k8sClient.Delete(ctx, model) }()
+			svc := &inferencev1alpha1.InferenceService{
+				ObjectMeta: metav1.ObjectMeta{Name: "lf-own-svc", Namespace: ns},
+				Spec:       inferencev1alpha1.InferenceServiceSpec{ModelRef: model.Name, ModelCache: &inferencev1alpha1.ModelCacheSpec{ClaimName: "node-b-lf"}},
+			}
+			Expect(k8sClient.Create(ctx, svc)).To(Succeed())
+			defer func() { _ = k8sClient.Delete(ctx, svc) }()
+			modelKey := types.NamespacedName{Name: model.Name, Namespace: ns}
+			ownKey := types.NamespacedName{Name: prefetchJobName(model), Namespace: ns}
+			sharedKey := types.NamespacedName{Name: prefetchTargetJobName(model, ModelCachePVCName), Namespace: ns}
+
+			_, _, err := prefetchReconciler().reconcilePrefetch(ctx, model)
+			Expect(err).NotTo(HaveOccurred())
+			job := &batchv1.Job{}
+			Expect(k8sClient.Get(ctx, ownKey, job)).To(Succeed())
+			Expect(jobClaim(job)).To(Equal("node-b-lf"), "the single referencing service's claim is the agreed target")
+
+			base, err := client.NewWithWatch(cfg, client.Options{Scheme: k8sClient.Scheme()})
+			Expect(err).NotTo(HaveOccurred())
+			failing := prefetchReconciler()
+			failing.Client = interceptor.NewClient(base, interceptor.Funcs{
+				List: func(ctx context.Context, c client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
+					if _, ok := list.(*inferencev1alpha1.InferenceServiceList); ok {
+						return errors.New("informer cache not synced")
+					}
+					return c.List(ctx, list, opts...)
+				},
+			})
+			Expect(k8sClient.Get(ctx, modelKey, model)).To(Succeed())
+			_, _, err = failing.reconcilePrefetch(ctx, model)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(k8sClient.Get(ctx, modelKey, model)).To(Succeed())
+			Expect(apierrors.IsNotFound(k8sClient.Get(ctx, sharedKey, &batchv1.Job{}))).To(BeTrue(), "no second own Job into the shared cache")
+			Expect(findPrefetchStatus(model, ModelCachePVCName)).To(BeNil())
+			own := findPrefetchStatus(model, "node-b-lf")
+			Expect(own).NotTo(BeNil())
+			Expect(own.Own).To(BeTrue())
+			Expect(model.Status.Phase).To(Equal(PhaseDownloading))
+
+			By("a Model with no target on record holding instead of guessing")
+			fresh := newPrefetchModel("model-prefetch-lf-fresh")
+			Expect(k8sClient.Create(ctx, fresh)).To(Succeed())
+			defer func() { _ = k8sClient.Delete(ctx, fresh) }()
+			freshKey := types.NamespacedName{Name: fresh.Name, Namespace: ns}
+			handled, result, err := failing.reconcilePrefetch(ctx, fresh)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(handled).To(BeTrue())
+			Expect(result.RequeueAfter).To(Equal(prefetchClaimWait))
+			Expect(apierrors.IsNotFound(k8sClient.Get(ctx, types.NamespacedName{Name: prefetchJobName(fresh), Namespace: ns}, &batchv1.Job{}))).To(BeTrue())
+			Expect(apierrors.IsNotFound(k8sClient.Get(ctx, types.NamespacedName{Name: prefetchTargetJobName(fresh, ModelCachePVCName), Namespace: ns}, &batchv1.Job{}))).To(BeTrue())
+			Expect(k8sClient.Get(ctx, freshKey, fresh)).To(Succeed())
+			Expect(fresh.Status.Prefetch).To(BeEmpty())
+			Expect(fresh.Status.Phase).To(Equal("Pending"))
+			progressing := meta.FindStatusCondition(fresh.Status.Conditions, ConditionProgressing)
+			Expect(progressing).NotTo(BeNil())
+			Expect(progressing.Reason).To(Equal(ReasonPrefetchListingFailed))
+		})
+
+		It("records the staged names for a Job adopted from a controller that wrote none", func() {
+			model := newPrefetchModel("model-prefetch-adopt")
+			Expect(k8sClient.Create(ctx, model)).To(Succeed())
+			defer func() { _ = k8sClient.Delete(ctx, model) }()
+			modelKey := types.NamespacedName{Name: model.Name, Namespace: ns}
+			jobKey := types.NamespacedName{Name: prefetchJobName(model), Namespace: ns}
+			job := &batchv1.Job{
+				ObjectMeta: metav1.ObjectMeta{Name: jobKey.Name, Namespace: ns,
+					OwnerReferences: []metav1.OwnerReference{*metav1.NewControllerRef(model, inferencev1alpha1.GroupVersion.WithKind("Model"))}},
+				Spec: batchv1.JobSpec{Template: corev1.PodTemplateSpec{Spec: corev1.PodSpec{
+					RestartPolicy: corev1.RestartPolicyNever,
+					Containers:    []corev1.Container{{Name: "download", Image: "busybox"}},
+				}}},
+			}
+			Expect(k8sClient.Create(ctx, job)).To(Succeed())
+			completeJob(jobKey)
+			_, _, err := prefetchReconciler().reconcilePrefetch(ctx, model)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(k8sClient.Get(ctx, modelKey, model)).To(Succeed())
+			entry := findPrefetchStatus(model, ModelCachePVCName)
+			Expect(entry).NotTo(BeNil())
+			Expect(entry.JobName).To(Equal(jobKey.Name))
+			Expect(entry.Phase).To(Equal(inferencev1alpha1.PrefetchPhaseSucceeded))
+			Expect(entry.Files).To(Equal([]string{canonicalModelBasename(model)}), "an upgraded Model gets the recorded-names protection too")
+		})
+
+		It("creates the shared claim with the Model's storageClassName", func() {
+			classNs := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "prefetch-class-test"}}
+			Expect(k8sClient.Create(ctx, classNs)).To(Succeed())
+			model := newPrefetchModel("model-prefetch-class")
+			model.Namespace = classNs.Name
+			model.Spec.ModelCache = &inferencev1alpha1.ModelCacheSpec{StorageClassName: "fast-nvme"}
+			Expect(k8sClient.Create(ctx, model)).To(Succeed())
+			defer func() { _ = k8sClient.Delete(ctx, model) }()
+			_, _, err := prefetchReconciler().reconcilePrefetch(ctx, model)
+			Expect(err).NotTo(HaveOccurred())
+			pvc := &corev1.PersistentVolumeClaim{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: ModelCachePVCName, Namespace: classNs.Name}, pvc)).To(Succeed())
+			Expect(pvc.Spec.StorageClassName).NotTo(BeNil())
+			Expect(*pvc.Spec.StorageClassName).To(Equal("fast-nvme"), "the class the inheriting services ask for, so none gets ModelCacheStorageClassIgnored")
+		})
+
 		// A claim a service requested is not the Model's own target: in
 		// perService mode that claim goes away with the service.
 		It("does not adopt a service's staged claim as its own target", func() {
@@ -891,6 +999,13 @@ var _ = Describe("Model Prefetch", func() {
 			Expect(k8sClient.Get(ctx, modelKey, model)).To(Succeed())
 			Expect(model.Status.Prefetch[0].Message).To(ContainSubstring("has been Pending"))
 			Expect(model.Status.Prefetch[0].Message).To(ContainSubstring("Multi-Attach"))
+			first, firstRV := model.Status.Prefetch[0].Message, model.ResourceVersion
+			time.Sleep(1100 * time.Millisecond)
+			_, _, err = r.reconcilePrefetch(ctx, model)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(k8sClient.Get(ctx, modelKey, model)).To(Succeed())
+			Expect(model.Status.Prefetch[0].Message).To(Equal(first), "a stalled pod's message must not change every pass: each change is a status write and a new event")
+			Expect(model.ResourceVersion).To(Equal(firstRV))
 			Expect(meta.FindStatusCondition(model.Status.Conditions, ConditionProgressing).Reason).To(Equal(ReasonPrefetchStalled))
 		})
 
@@ -1501,6 +1616,12 @@ var _ = Describe("Model Prefetch", func() {
 
 			short := &inferencev1alpha1.Model{ObjectMeta: metav1.ObjectMeta{Name: "llama", Namespace: ns}}
 			Expect(prefetchJobName(short)).To(Equal("llama-prefetch"))
+
+			a := &inferencev1alpha1.Model{ObjectMeta: metav1.ObjectMeta{Name: strings.Repeat("x", 60) + "-one", Namespace: ns}}
+			b := &inferencev1alpha1.Model{ObjectMeta: metav1.ObjectMeta{Name: strings.Repeat("x", 60) + "-two", Namespace: ns}}
+			Expect(prefetchJobName(a)).NotTo(Equal(prefetchJobName(b)), "names that share their kept prefix must not share a Job")
+			Expect(len(prefetchJobName(a))).To(BeNumerically("<=", 63))
+			Expect(prefetchTargetJobName(a, "c")).NotTo(Equal(prefetchTargetJobName(b, "c")))
 		})
 	})
 
