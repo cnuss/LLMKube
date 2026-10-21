@@ -34,6 +34,11 @@ contributors share. The human onboarding narrative lives in
   kubectl context.
 - `make test-e2e-apisix` requires Docker, Kind and `helm`, plus network access
   to the APISIX chart repository.
+- `make test-e2e-multinode` requires Docker and Kind; it creates a two-worker
+  Kind cluster whose workers share one host directory
+  (`E2E_SHARED_CACHE_DIR`, default `/tmp/llmkube-e2e-shared-cache`) and, like
+  `make test-e2e`, reuses an existing cluster of the same name, so run
+  `make cleanup-test-e2e` first if a single-node one is up.
 
 ## Commands
 
@@ -53,6 +58,7 @@ contributors share. The human onboarding narrative lives in
 | E2E tests (needs Kind)              | `make test-e2e`         |
 | Generated-RBAC e2e (needs Kind)     | `make test-e2e-rbac`   |
 | APISIX e2e (needs Kind and Helm)    | `make test-e2e-apisix` |
+| Multi-node prefetch e2e (needs Kind) | `make test-e2e-multinode` |
 | Format                              | `make fmt`              |
 | Vet                                 | `make vet`              |
 | Lint (golangci-lint)                | `make lint`             |

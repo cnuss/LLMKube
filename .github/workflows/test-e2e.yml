@@ -146,6 +146,40 @@ jobs:
         if: always()
         run: make cleanup-test-e2e
 
+  test-e2e-multinode:
+    name: Run on Ubuntu (kind, two workers, shared cache claim)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Clone the code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Setup Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+
+      - name: Install the latest version of kind
+        run: |
+          curl -Lo ./kind https://kind.sigs.k8s.io/dl/latest/kind-linux-amd64
+          chmod +x ./kind
+          sudo mv ./kind /usr/local/bin/kind
+
+      - name: Verify kind installation
+        run: kind version
+
+      # A prefetch Job on the download worker fills a hostPath claim both
+      # workers mount; a serving pod pinned to the "GPU" worker consumes it
+      # read-only with no downloader (#2136). The target creates the
+      # two-worker cluster from test/e2e/kind-multinode.yaml.
+      - name: Running the multi-node prefetch e2e
+        run: |
+          go mod tidy
+          make test-e2e-multinode
+
+      - name: Tear down the kind cluster
+        if: always()
+        run: kind delete cluster --name llmkube-test-e2e || true
+
   test-e2e-longhorn:
     name: Run on Ubuntu (kind + Longhorn, restrictive storage)
     runs-on: ubuntu-latest
