@@ -448,12 +448,11 @@ func (r *ModelReconciler) reconcilePrefetch(ctx context.Context, model *inferenc
 // persists it once if it changed.
 func (r *ModelReconciler) reconcilePrefetchState(ctx context.Context, model *inferencev1alpha1.Model) (bool, ctrl.Result, error) {
 	logger := logf.FromContext(ctx)
-	wantsOwn := modelWantsPrefetch(model)
 
 	// A source the downloader does not stage has nothing to prefetch. Say so
 	// when asked, rather than leaving spec.prefetch silently inert.
 	if !prefetchableSource(model) {
-		if wantsOwn {
+		if modelWantsPrefetch(model) {
 			r.setPrefetchSkipped(model)
 		} else {
 			meta.RemoveStatusCondition(&model.Status.Conditions, ConditionPrefetchSkipped)
@@ -461,6 +460,8 @@ func (r *ModelReconciler) reconcilePrefetchState(ctx context.Context, model *inf
 		return false, ctrl.Result{}, nil
 	}
 	meta.RemoveStatusCondition(&model.Status.Conditions, ConditionPrefetchSkipped)
+	// The Model's own prefetch, the one that gates its Ready.
+	wantsOwn := prefetchEligible(model)
 
 	services, listErr := r.referencingServices(ctx, model)
 	if listErr != nil {
