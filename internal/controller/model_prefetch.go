@@ -67,6 +67,10 @@ import (
 // and a change that does not merely refreshes the entry's generation. A Job
 // whose target is no longer wanted is deleted while it runs; a finished one
 // is left for its TTL.
+//
+// This file is the only writer of status.prefetch and the only creator of
+// prefetch Jobs. The InferenceService side (inferenceservice_prefetch.go)
+// consumes the entries; what both sides must agree on is in prefetch.go.
 
 // defaultPrefetchImage mirrors the --init-container-image flag default for
 // the no-op completion container when the reconciler is constructed without
@@ -201,60 +205,12 @@ func seedPrefetchCacheKey(model *inferencev1alpha1.Model) {
 	}
 }
 
-// modelWantsPrefetch reports whether the Model asks to be staged into its own
-// cache claim: spec.prefetch, or its alias spec.modelCache.prefetch.
-func modelWantsPrefetch(model *inferencev1alpha1.Model) bool {
-	if model == nil {
-		return false
-	}
-	return model.Spec.Prefetch || (model.Spec.ModelCache != nil && model.Spec.ModelCache.Prefetch)
-}
-
-// modelCacheClaimName returns spec.modelCache.claimName, or "".
-func modelCacheClaimName(model *inferencev1alpha1.Model) string {
-	if model == nil || model.Spec.ModelCache == nil {
-		return ""
-	}
-	return model.Spec.ModelCache.ClaimName
-}
-
-// prefetchableSource reports whether the Model's source is a remote artifact
-// the downloader stack can stage ahead of time (http/https/hf, or a bare
-// repo ID with spec.files). Local paths, pvc://, oci:// and s3:// sources
-// are not prefetched.
-func prefetchableSource(model *inferencev1alpha1.Model) bool {
-	if model == nil {
-		return false
-	}
-	// A source is prefetchable when it normalizes to a fetchable http(s) URL:
-	// hf:// and huggingface.co repo URLs become resolve URLs, direct file URLs
-	// stay as-is, while bare org/name (runtime-resolved), local paths, pvc://
-	// and s3:// do not. Checking the normalized scheme directly preserves the
-	// original semantics without depending on isRemoteHTTPSource's repo-vs-file
-	// classification.
-	normalized := normalizeHFSource(model.Spec.Source)
-	if hasSchemeFold(normalized, "https://") || hasSchemeFold(normalized, "http://") {
-		return true
-	}
-	// A bare repo ID with spec.files is staged by the operator (stagingRepoBase).
-	return hasMultiFileStaging(model) && isHFRepoSource(model.Spec.Source)
-}
-
 // prefetchEligible reports whether this Model's own prefetch runs: the field
 // is set and the source is one the downloader stages. A glob in spec.files no
 // longer disqualifies it; the prefetch path expands it from the repository
 // listing (#2071) before building the Job.
 func prefetchEligible(model *inferencev1alpha1.Model) bool {
 	return modelWantsPrefetch(model) && prefetchableSource(model)
-}
-
-// servicePrefetchRequested reports whether an InferenceService asks for its
-// Model to be prefetched into its own cache claim. Read after
-// inheritModelCache, so a service that inherits the Model's block inherits
-// the request too.
-func servicePrefetchRequested(isvc *inferencev1alpha1.InferenceService) bool {
-	return isvc != nil && isvc.Spec.ModelCache != nil && isvc.Spec.ModelCache.Prefetch &&
-		isvc.Spec.ModelCache.Persistence != inferencev1alpha1.ModelCachePersistenceEphemeral
 }
 
 // DefaultPrefetchJobReadTimeout bounds the read of the prefetch Job, so a
@@ -450,16 +406,6 @@ func prefetchJobModel(model *inferencev1alpha1.Model, plan *StagingPlan) *infere
 		jobModel.Spec.Files = append([]string(nil), plan.Files...)
 	}
 	return jobModel
-}
-
-// findPrefetchStatus returns the entry for claim, or nil.
-func findPrefetchStatus(model *inferencev1alpha1.Model, claim string) *inferencev1alpha1.PrefetchStatus {
-	for i := range model.Status.Prefetch {
-		if model.Status.Prefetch[i].ClaimName == claim {
-			return &model.Status.Prefetch[i]
-		}
-	}
-	return nil
 }
 
 // ensurePrefetchStatus returns the entry for claim, appending a Pending one.
@@ -1059,57 +1005,9 @@ func prefetchReverifyMessage(job, claim string) string {
 	return fmt.Sprintf("re-verifying claim %q with prefetch job %q: the earlier job is gone (expired or deleted); the entry stays usable, a cache hit completes in seconds", claim, job)
 }
 
-// ownedPrefetchJob returns the Job at name when it exists and model controls
-// it, else nil. The name is deterministic, so a user's Job can sit at it; a
-// Job this Model does not own is never adopted, replaced or deleted.
-func ownedPrefetchJob(ctx context.Context, c client.Reader, model *inferencev1alpha1.Model, name string) (*batchv1.Job, error) {
-	job := &batchv1.Job{}
-	if err := c.Get(ctx, types.NamespacedName{Name: name, Namespace: model.Namespace}, job); err != nil {
-		if apierrors.IsNotFound(err) {
-			return nil, nil
-		}
-		return nil, err
-	}
-	if !metav1.IsControlledBy(job, model) {
-		return nil, nil
-	}
-	return job, nil
-}
-
-// deletePrefetchJob removes a prefetch Job and its pod. The API server's
-// default for Jobs is to orphan the pod, so propagation is set; a Job that
-// is already gone is not an error.
-func deletePrefetchJob(ctx context.Context, c client.Client, job *batchv1.Job) error {
-	if err := c.Delete(ctx, job, client.PropagationPolicy(metav1.DeletePropagationBackground)); err != nil && !apierrors.IsNotFound(err) {
-		return err
-	}
-	return nil
-}
-
 // prefetchRunningMessage is the entry message while a Job stages claim.
 func prefetchRunningMessage(job, claim string) string {
 	return fmt.Sprintf("prefetch job %q downloading into %q", job, claim)
-}
-
-// serviceReportsPrefetchedFilesMissing reports whether a service's pods found
-// the staged files gone from the claim they mount.
-func serviceReportsPrefetchedFilesMissing(isvc *inferencev1alpha1.InferenceService) bool {
-	c := meta.FindStatusCondition(isvc.Status.Conditions, ConditionModelTransferHealthy)
-	return c != nil && c.Status == metav1.ConditionFalse && c.Reason == ReasonPrefetchedFilesMissing
-}
-
-// unprefetchedConsumerClaim returns the claim a service's pods mount when
-// that service relies on the Model's own prefetch rather than asking for its
-// own, and would download at serve time if the claim were not staged: the
-// Model asks for prefetch, the service does not, and the pods mount a cache
-// claim (not Metal, not an ephemeral or disabled cache, not a pre-staged
-// source). ok is false otherwise. isvc must carry its effective modelCache.
-func unprefetchedConsumerClaim(isvc *inferencev1alpha1.InferenceService, model *inferencev1alpha1.Model, cacheMode, cachePath string) (string, bool) {
-	if servicePrefetchRequested(isvc) || !modelWantsPrefetch(model) || isMetalModel(model) ||
-		!modelNeedsCachePVC(model, isvc, cachePath) {
-		return "", false
-	}
-	return modelCachePVCName(isvc, cacheMode), true
 }
 
 // pruneStalePrefetch drops entries no target wants any more. A Job still
@@ -1335,25 +1233,6 @@ func prefetchTargetName(target *inferencev1alpha1.InferenceService) string {
 		return claim
 	}
 	return ModelCachePVCName
-}
-
-// jobSucceeded / jobFailed read the Job's terminal conditions.
-func jobSucceeded(job *batchv1.Job) bool {
-	for _, c := range job.Status.Conditions {
-		if c.Type == batchv1.JobComplete && c.Status == corev1.ConditionTrue {
-			return true
-		}
-	}
-	return false
-}
-
-func jobFailed(job *batchv1.Job) bool {
-	for _, c := range job.Status.Conditions {
-		if c.Type == batchv1.JobFailed && c.Status == corev1.ConditionTrue {
-			return true
-		}
-	}
-	return false
 }
 
 // findModelForInferenceService maps an InferenceService to the Model it
