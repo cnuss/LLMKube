@@ -194,11 +194,8 @@ func TestPrefetchJob_SHA256Wiring(t *testing.T) {
 		model := sha256WiringModel("https://models.example.com/model.gguf")
 		model.Spec.SHA256 = sha256
 		seedPrefetchCacheKey(model)
-		target := &inferencev1alpha1.InferenceService{
-			ObjectMeta: metav1.ObjectMeta{Name: "target", Namespace: "default"},
-		}
 		r := &ModelReconciler{InitContainerImage: "img:latest"}
-		job, err := r.buildPrefetchJob(context.Background(), model, target)
+		job, err := r.buildPrefetchJob(context.Background(), model, ModelCachePVCName, "")
 		if err != nil {
 			t.Fatalf("buildPrefetchJob: %v", err)
 		}

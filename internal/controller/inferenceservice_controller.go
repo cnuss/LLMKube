@@ -232,6 +232,10 @@ func (r *InferenceServiceReconciler) Reconcile(ctx context.Context, req ctrl.Req
 		return ctrl.Result{}, err
 	}
 
+	// A service with no modelCache block of its own resolves the Model's
+	// (#2136), in memory: never written back to the spec.
+	inheritModelCache(inferenceService, model)
+
 	draftModel, draftReady, draftResult, err := r.getDraftModelForInferenceService(ctx, inferenceService)
 	if err != nil {
 		return ctrl.Result{}, err
@@ -275,6 +279,7 @@ func (r *InferenceServiceReconciler) Reconcile(ctx context.Context, req ctrl.Req
 	}
 
 	r.warnIgnoredModelCacheClaim(inferenceService, model)
+	r.warnPrefetchTargetMismatch(inferenceService, model)
 	r.warnUnboundedEphemeralCache(inferenceService)
 
 	isMetal := isMetalModel(model)
@@ -1499,6 +1504,11 @@ func (r *InferenceServiceReconciler) reconcileWorkload(
 		if err := r.teardownRelay(ctx, isvc); err != nil {
 			return nil, replicaCounts{}, nil, nil, err
 		}
+	}
+	// A requested prefetch that has not landed holds whatever serves today
+	// (#2136): no pods before the first one, no new template after it.
+	if held, dep, counts, result, err := r.holdForPrefetch(ctx, isvc, model, desiredReplicas, modelReady); held || err != nil {
+		return dep, counts, nil, result, err
 	}
 	if isvc.Spec.MultiNode != nil {
 		// A multiNode group runs no Deployment, so a marker left by a

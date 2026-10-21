@@ -25,6 +25,13 @@ func (c *hangingGetClient) Get(ctx context.Context, _ client.ObjectKey, _ client
 	return ctx.Err()
 }
 
+// The InferenceService listing that resolves prefetch targets is served by
+// an informer the InferenceService controller already runs; only the Job
+// read is the first touch of a type, so only it hangs here.
+func (c *hangingGetClient) List(context.Context, client.ObjectList, ...client.ListOption) error {
+	return nil
+}
+
 // A prefetch-eligible Model: remote source, prefetch on, not already complete.
 func prefetchModelForTimeout() *inferencev1alpha1.Model {
 	return &inferencev1alpha1.Model{

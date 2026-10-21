@@ -108,6 +108,14 @@ type modelTransferSignature struct {
 // wrong label is worse than the bare exit code the user already has.
 var modelTransferSignatures = []modelTransferSignature{
 	{
+		// A pod rendered to consume a prefetched cache found a staged file
+		// absent. The token is unique to the model-verify container.
+		reason: ReasonPrefetchedFilesMissing,
+		remedy: "a file the Model's prefetch should have staged is missing from the cache claim the pod mounts; " +
+			"check the Model's status.prefetch entry for that claim and its Job's pod logs, and delete the Job to stage again",
+		matches: []string{"prefetchedfilesmissing"},
+	},
+	{
 		// A pod built before the Model recorded its glob expansion. The token
 		// is unique to that message and lowercase, so it cannot shadow the
 		// digest or curl entries below.
@@ -238,7 +246,7 @@ func matchModelTransferFailure(msg string) (reason, matchedLine string, found bo
 // init container injected by a mesh or a policy controller is never diagnosed
 // as our transfer failing.
 func isGeneratedInitContainer(name string) bool {
-	return name == "model-downloader" || name == "model-cache-prep"
+	return name == "model-downloader" || name == "model-cache-prep" || name == "model-verify"
 }
 
 // findModelTransferFailure scans pods for a generated init container that

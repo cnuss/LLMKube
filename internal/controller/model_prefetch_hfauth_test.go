@@ -29,7 +29,7 @@ func TestPrefetchJob_CarriesHFAuth(t *testing.T) {
 		Status: inferencev1alpha1.ModelStatus{CacheKey: "testcachekey"},
 	}
 
-	job, err := r.buildPrefetchJob(context.Background(), model, nil)
+	job, err := r.buildPrefetchJob(context.Background(), model, "", "")
 	if err != nil {
 		t.Fatalf("buildPrefetchJob: %v", err)
 	}
@@ -78,7 +78,7 @@ func TestPrefetchJob_NoHFAuthForOtherHosts(t *testing.T) {
 		Status: inferencev1alpha1.ModelStatus{CacheKey: "testcachekey"},
 	}
 
-	job, err := r.buildPrefetchJob(context.Background(), model, nil)
+	job, err := r.buildPrefetchJob(context.Background(), model, "", "")
 	if err != nil {
 		t.Fatalf("buildPrefetchJob: %v", err)
 	}
@@ -114,7 +114,7 @@ func TestPrefetchJob_CarriesHFAuthForMirror(t *testing.T) {
 		Status: inferencev1alpha1.ModelStatus{CacheKey: "testcachekey"},
 	}
 
-	job, err := r.buildPrefetchJob(context.Background(), model, nil)
+	job, err := r.buildPrefetchJob(context.Background(), model, "", "")
 	if err != nil {
 		t.Fatalf("buildPrefetchJob: %v", err)
 	}
@@ -129,7 +129,7 @@ func TestPrefetchJob_CarriesHFAuthForMirror(t *testing.T) {
 	// The lookalike host must not authenticate even with the same Secret.
 	lookalike := model.DeepCopy()
 	lookalike.Spec.Source = "https://artifactory.corp.example.evil.example/repo/m.gguf"
-	job, err = r.buildPrefetchJob(context.Background(), lookalike, nil)
+	job, err = r.buildPrefetchJob(context.Background(), lookalike, "", "")
 	if err != nil {
 		t.Fatalf("buildPrefetchJob(lookalike): %v", err)
 	}

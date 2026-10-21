@@ -126,19 +126,32 @@ The PVC should show `Bound`, the pod should report the tainted GPU node, and
 A `WaitForFirstConsumer` local-path claim binds to whichever pod schedules
 first. When `spec.prefetch: true` warms such a claim (#1676), that pod is the
 prefetch Job, so the placement decision belongs there: set
-`spec.prefetchNodeSelector` (and `spec.prefetchTolerations`) on the Model so
-the download lands on the node that will serve it. Without a selector the PV
-can bind to a node the InferenceService never runs on.
+`spec.prefetchNodeSelector` (and `spec.prefetchTolerations`, or a
+`spec.prefetchAffinity` for what a selector cannot say) on the Model so the
+download lands on the node that will serve it. Without a selector the PV can
+bind to a node the InferenceService never runs on.
 
 ```yaml
 spec:
   prefetch: true
+  modelCache:
+    claimName: model-cache      # the claim to warm; inherited by services without their own
   prefetchTolerations:
     - key: example-gpu
       operator: Exists
   prefetchNodeSelector:
     example.com/node-pool: gpu
 ```
+
+Name the claim on the Model with `spec.modelCache.claimName` rather than
+relying on the services to agree: it is the prefetch target whatever services
+exist, and a service with no `modelCache` block of its own inherits it. A
+service can also require that its weights were staged before it starts, with
+`spec.modelCache.prefetch: true`; it then creates no pods until the prefetch
+into its claim succeeds, and its pods mount the claim read-only with no
+downloader. See the Prefetch section of `docs/MODEL-CACHE.md` for the full
+contract, including the `PrefetchTargetMismatch` and `PrefetchSkipped`
+conditions.
 
 ### Why a tolerated inference pod may still have a Pending PVC
 
@@ -345,9 +358,9 @@ are downloaded from. Other sources need explicit paths.
 - A serving pod built before the expansion is recorded for its generation
   exits with `StagedFilesNotCurrent`, naming the Model whose status holds the
   cause, rather than blaming `spec.files`.
-- A glob turns off `spec.prefetch`: the expansion is written when the Model
-  reconciles, after prefetch would run, so the files stage when the serving
-  pod starts instead.
+- A prefetch (`spec.prefetch`, or `modelCache.prefetch` on a service)
+  expands the glob the same way before its Job is built, and records the
+  expansion when it completes; the Job stages the expanded set.
 - `spec.fileSha256` still needs explicit paths.
 
 Properties worth knowing:

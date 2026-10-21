@@ -9,11 +9,13 @@
 # instead of a cold multi-GB download.
 #
 # Notes:
-# - Prefetch applies to remote sources (https://, hf://). Local paths and
-#   pvc:// sources have nothing to prefetch and ignore the field.
-# - The prefetch targets the SHARED cache. Fleets running perService cache
-#   mode cannot be pre-populated this way; pre-stage with a pvc:// source
-#   instead.
+# - Prefetch applies to remote sources (https://, hf://, a repo ID with
+#   spec.files). Local paths, pvc://, oci:// and s3:// sources have nothing
+#   to prefetch; the Model reports PrefetchSkipped instead.
+# - Without spec.modelCache.claimName the Job targets the claim the
+#   referencing InferenceServices agree on, else the SHARED cache. See
+#   model_prefetch_gitops.yaml for naming the claim on the Model and having
+#   the service wait for the staging.
 # - The Job is garbage-collected with the Model (owner reference) and
 #   self-cleans 24h after finishing.
 apiVersion: inference.llmkube.dev/v1alpha1

@@ -41,9 +41,12 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/events"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	inferencev1alpha1 "github.com/defilantech/llmkube/api/v1alpha1"
@@ -158,9 +161,14 @@ type ModelReconciler struct {
 	ModelCacheSize       string
 	ModelCacheClass      string
 	ModelCacheAccessMode string
+	// ModelCacheMode is the InferenceService reconciler's cache mode, so a
+	// service-requested prefetch (#2136) targets the claim that service's
+	// pods mount (modelCachePVCName), including a perService claim.
+	ModelCacheMode string
 
-	// Recorder emits Warning events on the Model (today only for a prefetch
-	// held on a missing CA ConfigMap). Nil disables events.
+	// Recorder emits Warning events on the Model (a prefetch held on a
+	// missing CA ConfigMap, a prefetch skipped on an unstageable source).
+	// Nil disables events.
 	Recorder events.EventRecorder
 
 	// metadataHTTPClient is the SSRF-guarded client used for all controller-
@@ -242,16 +250,20 @@ func (r *ModelReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 		return result, nil
 	}
 
-	// Prefetch (#904): an eligible Model is downloaded into the shared
-	// cache by an owner-ref'd Job before any InferenceService exists.
-	if handled, result, err := r.reconcilePrefetch(ctx, model); handled {
-		return result, err
+	// Prefetch (#904): an eligible Model is downloaded into a model cache
+	// claim by an owner-ref'd Job before any InferenceService exists. A
+	// prefetch an InferenceService requested for its own claim (#2136) does
+	// not gate Ready: the path falls through with a poll interval instead.
+	handled, prefetchResult, err := r.reconcilePrefetch(ctx, model)
+	if handled || err != nil {
+		return prefetchResult, err
 	}
 
 	// Sources that need no controller-side download (PVC, HuggingFace repo,
 	// remote HTTP, Metal local-path) are dispatched here. handled=false means
 	// the source is a local path the controller must copy itself.
 	if handled, result, err := r.reconcileBySourceType(ctx, model); handled {
+		result.RequeueAfter = earliestPositive(result.RequeueAfter, prefetchResult.RequeueAfter)
 		return result, err
 	}
 
@@ -1683,5 +1695,14 @@ func (r *ModelReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		For(&inferencev1alpha1.Model{}).
 		Named("model").
 		WithOptions(controller.Options{MaxConcurrentReconciles: ModelReconcileConcurrency}).
+		// A service created or retargeted after its Model moves the prefetch
+		// target (#2136). Spec changes only: a service's status writes must
+		// not fan out into Model reconciles, which write status the service
+		// controller watches in turn.
+		Watches(
+			&inferencev1alpha1.InferenceService{},
+			handler.EnqueueRequestsFromMapFunc(r.findModelForInferenceService),
+			builder.WithPredicates(predicate.GenerationChangedPredicate{}),
+		).
 		Complete(rec)
 }

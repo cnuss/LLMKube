@@ -7,8 +7,11 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 
+	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
@@ -167,12 +170,11 @@ func TestReconcileRuntimeResolved_BareRepoIDListsFromMirror(t *testing.T) {
 	}
 }
 
-// The glob expansion is written only by the runtime-resolved reconcile, which
-// runs after prefetch. A prefetch Job built before it would stage an
-// unexpanded glob and fail, so a Model with a glob and spec.prefetch must skip
-// prefetch and still reach Ready with the expansion; its files then stage
-// when the serving pod starts.
-func TestReconcile_GlobWithPrefetchReachesReady(t *testing.T) {
+// A glob in spec.files no longer turns prefetch off (#2136): the prefetch path
+// expands it from the repository listing, builds the Job from the expanded
+// set, and holds the Model in Downloading until the Job completes. Ready then
+// carries the expansion for the serving pods.
+func TestReconcile_GlobWithPrefetchStagesExpandedFiles(t *testing.T) {
 	body, err := os.ReadFile("testdata/hflisting/artifactory-tree-qwen.json")
 	if err != nil {
 		t.Fatal(err)
@@ -190,6 +192,7 @@ func TestReconcile_GlobWithPrefetchReachesReady(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{Name: "huggingface", Namespace: "default"},
 		Data:       map[string][]byte{"HF_ENDPOINT": []byte(endpoint)},
 	}
+	const expanded = "config.json generation_config.json tokenizer.json tokenizer_config.json vocab.json model.safetensors"
 
 	for _, source := range []string{"Qwen/Qwen2.5-0.5B-Instruct", "hf://Qwen/Qwen2.5-0.5B-Instruct"} {
 		t.Run(source, func(t *testing.T) {
@@ -203,25 +206,118 @@ func TestReconcile_GlobWithPrefetchReachesReady(t *testing.T) {
 					Files:           []string{"config.json", "*.json", "*.safetensors"},
 				},
 			}
-			if prefetchEligible(model) {
-				t.Error("a Model with a glob in spec.files is prefetch-eligible")
+			if !prefetchEligible(model) {
+				t.Fatal("a Model with a glob in spec.files is not prefetch-eligible")
 			}
 			r := newMultiFileGateReconciler(t, model, secret)
 			r.AllowedRemoteHosts = []string{"127.0.0.1"}
 			r.InitContainerImage = defaultPrefetchImage
 			r.Scheme = r.Client.Scheme()
-			for i := 0; i < 3; i++ {
-				if _, err := r.Reconcile(context.Background(), reconcile.Request{NamespacedName: types.NamespacedName{Name: "qwen", Namespace: "default"}}); err != nil {
-					t.Fatalf("reconcile %d: %v", i, err)
-				}
+			req := reconcile.Request{NamespacedName: types.NamespacedName{Name: "qwen", Namespace: "default"}}
+			ctx := context.Background()
+
+			if _, err := r.Reconcile(ctx, req); err != nil {
+				t.Fatalf("reconcile: %v", err)
 			}
 			stored := getModel(t, r, "qwen")
-			want := "config.json generation_config.json tokenizer.json tokenizer_config.json vocab.json model.safetensors"
-			if got := strings.Join(stored.Status.StagedFiles, " "); stored.Status.Phase != PhaseReady || got != want {
-				t.Errorf("phase = %q, stagedFiles = %q; want Ready and %q (conditions=%+v)", stored.Status.Phase, got, want, stored.Status.Conditions)
+			if stored.Status.Phase != PhaseDownloading {
+				t.Fatalf("phase = %q, want Downloading while the prefetch Job runs (conditions=%+v)", stored.Status.Phase, stored.Status.Conditions)
+			}
+			var job batchv1.Job
+			if err := r.Get(ctx, types.NamespacedName{Name: prefetchJobName(model), Namespace: "default"}, &job); err != nil {
+				t.Fatalf("prefetch Job: %v", err)
+			}
+			if got := strings.ReplaceAll(prefetchJobFiles(&job), "\n", " "); got != expanded {
+				t.Errorf("Job stages %q, want the expansion %q", got, expanded)
+			}
+			if len(stored.Status.Prefetch) != 1 || stored.Status.Prefetch[0].Phase != inferencev1alpha1.PrefetchPhaseRunning ||
+				stored.Status.Prefetch[0].ClaimName != ModelCachePVCName || stored.Status.Prefetch[0].JobName != job.Name {
+				t.Errorf("status.prefetch = %+v, want one Running entry for %q driven by %q", stored.Status.Prefetch, ModelCachePVCName, job.Name)
+			}
+
+			job.Status.Conditions = []batchv1.JobCondition{{Type: batchv1.JobComplete, Status: corev1.ConditionTrue}}
+			if err := r.Status().Update(ctx, &job); err != nil {
+				t.Fatalf("complete Job: %v", err)
+			}
+			for i := 0; i < 2; i++ {
+				if _, err := r.Reconcile(ctx, req); err != nil {
+					t.Fatalf("reconcile after completion %d: %v", i, err)
+				}
+			}
+			stored = getModel(t, r, "qwen")
+			if got := strings.Join(stored.Status.StagedFiles, " "); stored.Status.Phase != PhaseReady || got != expanded {
+				t.Errorf("phase = %q, stagedFiles = %q; want Ready and %q (conditions=%+v)", stored.Status.Phase, got, expanded, stored.Status.Conditions)
+			}
+			if len(stored.Status.Prefetch) != 1 || stored.Status.Prefetch[0].Phase != inferencev1alpha1.PrefetchPhaseSucceeded {
+				t.Errorf("status.prefetch = %+v, want one Succeeded entry", stored.Status.Prefetch)
 			}
 		})
 	}
+}
+
+// A listing that fails leaves the Model Degraded with the cause and starts no
+// Job: a Job built from an unexpanded glob would stage a literal pattern.
+func TestReconcile_GlobWithPrefetchListingFailure(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "nope", http.StatusUnauthorized)
+	}))
+	defer srv.Close()
+	endpoint := srv.URL + "/artifactory/api/huggingfaceml/hf-remote"
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "huggingface", Namespace: "default"},
+		Data:       map[string][]byte{"HF_ENDPOINT": []byte(endpoint)},
+	}
+	model := &inferencev1alpha1.Model{
+		ObjectMeta: metav1.ObjectMeta{Name: "qwen", Namespace: "default", Generation: 1},
+		Spec: inferencev1alpha1.ModelSpec{
+			Source:          "Qwen/Qwen2.5-0.5B-Instruct",
+			Format:          "safetensors",
+			Prefetch:        true,
+			SourceSecretRef: &corev1.LocalObjectReference{Name: "huggingface"},
+			Files:           []string{"config.json", "*.safetensors"},
+		},
+	}
+	r := newMultiFileGateReconciler(t, model, secret)
+	r.AllowedRemoteHosts = []string{"127.0.0.1"}
+	r.InitContainerImage = defaultPrefetchImage
+	r.Scheme = r.Client.Scheme()
+	ctx := context.Background()
+
+	result, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Name: "qwen", Namespace: "default"}})
+	if err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if result.RequeueAfter != time.Minute {
+		t.Errorf("requeue = %v, want a minute as the runtime-resolved path retries a listing", result.RequeueAfter)
+	}
+	stored := getModel(t, r, "qwen")
+	cond := meta.FindStatusCondition(stored.Status.Conditions, ConditionDegraded)
+	if stored.Status.Phase != PhaseFailed || cond == nil || cond.Reason != "RepoListingFailed" || !strings.Contains(cond.Message, "401") {
+		t.Errorf("phase = %q, degraded = %+v; want Failed with RepoListingFailed naming the 401", stored.Status.Phase, cond)
+	}
+	var jobs batchv1.JobList
+	if err := r.List(ctx, &jobs); err != nil {
+		t.Fatal(err)
+	}
+	if len(jobs.Items) != 0 {
+		t.Errorf("a prefetch Job was created from an unexpanded glob: %+v", jobs.Items)
+	}
+}
+
+// prefetchJobFiles returns the newline-separated file list the Job's
+// downloader stages, or "" when the Job has no downloader.
+func prefetchJobFiles(job *batchv1.Job) string {
+	for _, c := range job.Spec.Template.Spec.InitContainers {
+		if c.Name != "model-downloader" {
+			continue
+		}
+		for _, e := range c.Env {
+			if e.Name == "MODEL_FILES" {
+				return e.Value
+			}
+		}
+	}
+	return ""
 }
 
 // A source copied from the Hub with a trailing slash is the same repository as

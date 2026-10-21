@@ -160,6 +160,7 @@ const (
 // +kubebuilder:validation:XValidation:rule="!(has(self.persistence) && self.persistence == 'Ephemeral' && has(self.claimName))",message="claimName cannot be set when persistence is Ephemeral: one names a cache volume to use, the other declines to use any"
 // +kubebuilder:validation:XValidation:rule="!(has(self.storageClassName) && has(self.claimName))",message="storageClassName cannot be set together with claimName: the named claim is user-owned and its storage class was chosen when the claim itself was created"
 // +kubebuilder:validation:XValidation:rule="!(has(self.persistence) && self.persistence == 'Ephemeral' && has(self.storageClassName))",message="storageClassName cannot be set when persistence is Ephemeral: the weights land in an emptyDir and no PVC is created to class"
+// +kubebuilder:validation:XValidation:rule="!(has(self.persistence) && self.persistence == 'Ephemeral' && has(self.prefetch) && self.prefetch)",message="prefetch cannot be set when persistence is Ephemeral: there is no cache volume to stage into"
 type ModelCacheSpec struct {
 	// Persistence selects whether weights survive a Pod restart.
 	//
@@ -234,6 +235,34 @@ type ModelCacheSpec struct {
 	// +kubebuilder:validation:MaxLength=63
 	// +optional
 	StorageClassName string `json:"storageClassName,omitempty"`
+
+	// Prefetch asks for the Model's weights to be staged into this cache claim
+	// by a prefetch Job before any serving pod consumes them.
+	//
+	// On an InferenceService, the operator runs the referenced Model's
+	// prefetch Job against this service's resolved cache claim (claimName,
+	// else the Model's spec.modelCache.claimName, else the operator cache),
+	// placed by the Model's prefetchNodeSelector, prefetchTolerations and
+	// prefetchAffinity, whether or not the Model sets spec.prefetch. The
+	// service creates no pods, and rolls no new pod template, until that
+	// prefetch has succeeded for the Model's current spec; meanwhile it
+	// reports ModelPrefetched=False with reason WaitingForPrefetch (or
+	// PrefetchFailed, with the live workload left as it was). Once staged, the
+	// serving pods mount the claim read-only with no downloader init
+	// container, and fail with PrefetchedFilesMissing rather than download on
+	// the serving node if a staged file is absent. Progress is reported per
+	// claim in the Model's status.prefetch.
+	//
+	// On a Model, it is equivalent to spec.prefetch: either field makes the
+	// Model stage itself into its own modelCache.claimName.
+	//
+	// Cannot be set with persistence Ephemeral: an emptyDir cannot be
+	// prefetched. Reported as PrefetchNotApplicable, and not waited for, when
+	// the source is one the downloader does not stage (pvc://, oci://, local
+	// paths, s3://), on Metal (no cache claim is mounted), or when model
+	// caching is disabled on the operator.
+	// +optional
+	Prefetch bool `json:"prefetch,omitempty"`
 }
 
 // DefaultMultiNodeRendezvousPort is the torch.distributed rendezvous port rank 0

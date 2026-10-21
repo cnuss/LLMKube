@@ -1,0 +1,54 @@
+# Prefetch for a GitOps-applied Model + InferenceService pair (#2136).
+#
+# The Model names the cache claim it is staged into (spec.modelCache), so the
+# prefetch target does not depend on which object the sync applies first, and
+# the service inherits the same claim. The service asks for the staging with
+# modelCache.prefetch: it creates no pods until the prefetch Job has filled the
+# claim, and its pods then mount the claim read-only with no downloader, so
+# the checkpoint is never downloaded on the GPU nodes.
+#
+# Notes:
+# - A glob in spec.files is expanded from the repository listing before the
+#   Job is built, as it is for the serving pods.
+# - prefetchAffinity keeps the download off the GPU nodes; the claim must be
+#   reachable from both the download node and the serving node (an RWX class,
+#   or a claim pinned to a node that does both).
+# - Progress is in the Model's status.prefetch (one entry per claim) and in
+#   the service's ModelPrefetched condition.
+apiVersion: inference.llmkube.dev/v1alpha1
+kind: Model
+metadata:
+  name: glm-5-3-flash
+  namespace: default
+spec:
+  source: nvidia/GLM-5.3-Flash-NVFP4
+  format: safetensors
+  sourceSecretRef:
+    name: huggingface
+  files:
+    - config.json
+    - "*.json"
+    - "*.jinja"
+    - "*.safetensors"
+  prefetch: true
+  modelCache:
+    claimName: model-cache
+  prefetchAffinity:
+    nodeAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        nodeSelectorTerms:
+          - matchExpressions:
+              - key: nvidia.com/gpu.present
+                operator: DoesNotExist
+---
+apiVersion: inference.llmkube.dev/v1alpha1
+kind: InferenceService
+metadata:
+  name: glm
+  namespace: default
+spec:
+  modelRef: glm-5-3-flash
+  runtime: vllm
+  modelCache:
+    claimName: model-cache
+    prefetch: true

@@ -41,6 +41,7 @@ type SHA256Digest string
 // +kubebuilder:validation:XValidation:rule="!has(self.fileSha256) || self.fileSha256.size() == 0 || !has(self.files) || self.files.all(f, !f.contains('*') && !f.contains('?') && !f.contains('['))",message="fileSha256 needs concrete file paths: a glob cannot be keyed to an unknown expanded name"
 // +kubebuilder:validation:XValidation:rule="!has(self.fileSha256) || self.fileSha256.size() == 0 || self.fileSha256.all(k, (has(self.files) && self.files.exists(f, f == k)) || (has(self.mmproj) && self.mmproj == k))",message="every fileSha256 key must name a spec.files entry or spec.mmproj"
 // +kubebuilder:validation:XValidation:rule="!has(self.fileSha256) || self.fileSha256.size() == 0 || self.fileSha256.all(k, !k.matches('[[:space:]]'))",message="fileSha256 keys must not contain whitespace"
+// +kubebuilder:validation:XValidation:rule="!(has(self.prefetch) && self.prefetch && has(self.modelCache) && has(self.modelCache.persistence) && self.modelCache.persistence == 'Ephemeral')",message="prefetch cannot be combined with modelCache.persistence Ephemeral: there is no cache volume to stage into"
 type ModelSpec struct {
 	// Source defines where to obtain the model.
 	// For GGUF models: URL or path to a .gguf file.
@@ -138,16 +139,26 @@ type ModelSpec struct {
 	RefreshPolicy string `json:"refreshPolicy,omitempty"`
 
 	// Prefetch, when true on a remote (http/https/hf) source, makes the
-	// operator eagerly download the artifact into the namespace's SHARED
-	// model cache PVC (llmkube-model-cache) via an owner-ref'd Job that
-	// reuses the serving init-container download stack, instead of waiting
-	// for the first InferenceService to pull it at serve time. Progress is
-	// reflected in status (Downloading, then Ready with cacheKey set), so
-	// the first serving pod starts from a cache hit. Fleets running
-	// modelCache.mode=perService still download per-service at serve time:
-	// prefetch targets the shared cache only, and staging via a pvc://
-	// source remains the alternative there. Ignored for local and pvc://
-	// sources, which need no remote fetch.
+	// operator download the artifact into a model cache PVC ahead of any
+	// InferenceService, via an owner-ref'd Job that reuses the serving
+	// init-container download stack. The Model reads Downloading until the
+	// Job completes and Ready after it, so a referencing service starts from
+	// a cache hit. A glob in spec.files is expanded from the repository
+	// listing before the Job is built, as the serving path expands it.
+	//
+	// The Job stages into spec.modelCache.claimName when set. Otherwise the
+	// target is inferred: the single modelCache.claimName the referencing
+	// InferenceServices agree on, else the namespace's shared cache
+	// (llmkube-model-cache). Where every prefetch landed is recorded per
+	// claim in status.prefetch; a referencing service that mounts a claim the
+	// Model was not staged into is reported by the PrefetchTargetMismatch
+	// condition, since it downloads at serve time. A service can instead ask
+	// for its own staging with modelCache.prefetch, which also holds its
+	// rollout until the weights are in place.
+	//
+	// A source the downloader does not stage (local paths, pvc://, oci://,
+	// s3://) is reported by the PrefetchSkipped condition rather than
+	// prefetched.
 	// +optional
 	Prefetch bool `json:"prefetch,omitempty"`
 
@@ -170,6 +181,30 @@ type ModelSpec struct {
 	// node the InferenceService never runs on (#1964).
 	// +optional
 	PrefetchNodeSelector map[string]string `json:"prefetchNodeSelector,omitempty"`
+
+	// PrefetchAffinity is applied to the prefetch Job's pod alongside
+	// PrefetchNodeSelector and PrefetchTolerations, and governs nothing else.
+	// It expresses what a selector cannot: keep the download off the GPU
+	// nodes (a NotIn or DoesNotExist node affinity), a list of allowed hosts,
+	// or a preference rather than a requirement.
+	// +optional
+	PrefetchAffinity *corev1.Affinity `json:"prefetchAffinity,omitempty"`
+
+	// ModelCache names the cache claim this Model is staged into, with the
+	// same fields an InferenceService's spec.modelCache carries.
+	//
+	// When claimName is set it is the prefetch target: the Job writes there
+	// and never falls back to the shared cache, whatever services exist. It
+	// is also the default for referencing InferenceServices: a service with
+	// no modelCache block of its own inherits this one, so the claim is
+	// declared once in a GitOps-applied pair; a service that sets its own
+	// block still wins. modelCache.prefetch is an alias of spec.prefetch.
+	//
+	// Without it, the prefetch target is inferred from the referencing
+	// services as before. persistence Ephemeral cannot be combined with
+	// prefetch: there is no cache volume to stage into.
+	// +optional
+	ModelCache *ModelCacheSpec `json:"modelCache,omitempty"`
 
 	// Format specifies the model file format.
 	// "gguf" is used with the llama-server runtime; "mlx" is used with the oMLX runtime;
@@ -445,6 +480,60 @@ type GGUFMetadata struct {
 	License string `json:"license,omitempty"`
 }
 
+// Prefetch phases, as reported in PrefetchStatus.Phase.
+const (
+	// PrefetchPhasePending: the Job is held, for example on a cache claim or
+	// CA ConfigMap that does not exist yet; Message names the cause.
+	PrefetchPhasePending = "Pending"
+	// PrefetchPhaseRunning: the Job exists and has not finished.
+	PrefetchPhaseRunning = "Running"
+	// PrefetchPhaseSucceeded: the claim holds the files of the staged spec.
+	PrefetchPhaseSucceeded = "Succeeded"
+	// PrefetchPhaseFailed: the Job failed; see its pod logs. Deleting the Job
+	// retries, as does any spec change that alters what is staged.
+	PrefetchPhaseFailed = "Failed"
+)
+
+// PrefetchStatus is the state of one prefetch target: a Model staged into one
+// cache claim.
+type PrefetchStatus struct {
+	// ClaimName is the PersistentVolumeClaim the Job stages into.
+	// +kubebuilder:validation:MinLength=1
+	ClaimName string `json:"claimName"`
+
+	// CacheKey is the cache directory under the claim the files land in.
+	// +optional
+	CacheKey string `json:"cacheKey,omitempty"`
+
+	// Phase is Pending, Running, Succeeded or Failed.
+	// +kubebuilder:validation:Enum=Pending;Running;Succeeded;Failed
+	Phase string `json:"phase"`
+
+	// JobName is the prefetch Job driving this entry. The Job is removed a
+	// day after it finishes; the entry outlives it.
+	// +optional
+	JobName string `json:"jobName,omitempty"`
+
+	// Fingerprint identifies the source and file set the entry staged. A
+	// spec change that alters it starts a new prefetch into the same claim.
+	// +optional
+	Fingerprint string `json:"fingerprint,omitempty"`
+
+	// ObservedGeneration is the Model generation the entry was last
+	// confirmed against. A consumer treats an entry whose generation trails
+	// the Model's as not yet current.
+	// +optional
+	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
+
+	// Message explains a Pending or Failed phase.
+	// +optional
+	Message string `json:"message,omitempty"`
+
+	// LastTransitionTime is when Phase last changed.
+	// +optional
+	LastTransitionTime *metav1.Time `json:"lastTransitionTime,omitempty"`
+}
+
 // ModelStatus defines the observed state of Model.
 type ModelStatus struct {
 	// Phase represents the current lifecycle phase of the model.
@@ -475,6 +564,15 @@ type ModelStatus struct {
 	// Populated when spec.files or spec.mmproj are set.
 	// +optional
 	StagedFiles []string `json:"stagedFiles,omitempty"`
+
+	// Prefetch reports every cache claim this Model has been, or is being,
+	// prefetched into: one entry per claim, whether the Model asked for it
+	// (spec.prefetch) or a referencing InferenceService did
+	// (modelCache.prefetch). A service waits on the entry for its own claim.
+	// +listType=map
+	// +listMapKey=claimName
+	// +optional
+	Prefetch []PrefetchStatus `json:"prefetch,omitempty"`
 
 	// SourceETag is the HTTP ETag recorded for the upstream source at the last
 	// revalidation. Used to detect upstream changes for http/https sources
