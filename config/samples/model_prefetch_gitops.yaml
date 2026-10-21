@@ -8,8 +8,12 @@
 # the checkpoint is never downloaded on the GPU nodes.
 #
 # Notes:
+# - Qwen2.5-0.5B-Instruct is about 1 GiB, so the whole flow runs in minutes.
+#   The same manifests stage a 190 GiB checkpoint; a gated repository also
+#   needs spec.sourceSecretRef naming a Secret with HF_TOKEN.
 # - A glob in spec.files is expanded from the repository listing before the
-#   Job is built, as it is for the serving pods.
+#   Job is built, as it is for the serving pods. Every pattern must match at
+#   least one file.
 # - prefetchAffinity keeps the download off the GPU nodes. That needs a claim
 #   every node can reach (an RWX class, a blob mount). A claim on one GPU
 #   node's local disk can only be filled from that node: drop the affinity
@@ -22,17 +26,14 @@
 apiVersion: inference.llmkube.dev/v1alpha1
 kind: Model
 metadata:
-  name: glm-5-3-flash
+  name: qwen2-5-0-5b-instruct
   namespace: default
 spec:
-  source: nvidia/GLM-5.3-Flash-NVFP4
+  source: Qwen/Qwen2.5-0.5B-Instruct
   format: safetensors
-  sourceSecretRef:
-    name: huggingface
   files:
     - config.json
     - "*.json"
-    - "*.jinja"
     - "*.safetensors"
   prefetch: true
   modelCache:
@@ -48,10 +49,10 @@ spec:
 apiVersion: inference.llmkube.dev/v1alpha1
 kind: InferenceService
 metadata:
-  name: glm
+  name: qwen
   namespace: default
 spec:
-  modelRef: glm-5-3-flash
+  modelRef: qwen2-5-0-5b-instruct
   runtime: vllm
   modelCache:
     claimName: model-cache

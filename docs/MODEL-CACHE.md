@@ -246,13 +246,11 @@ An `InferenceService` can ask for its own staging with
 apiVersion: inference.llmkube.dev/v1alpha1
 kind: Model
 metadata:
-  name: glm-5-3-flash
+  name: qwen2-5-0-5b-instruct
 spec:
-  source: nvidia/GLM-5.3-Flash-NVFP4
+  source: Qwen/Qwen2.5-0.5B-Instruct   # about 1 GiB; a gated repo adds sourceSecretRef
   format: safetensors
-  sourceSecretRef:
-    name: huggingface
-  files: [config.json, "*.json", "*.jinja", "*.safetensors"]
+  files: [config.json, "*.json", "*.safetensors"]
   modelCache:
     claimName: model-cache
   prefetchAffinity:
@@ -265,9 +263,9 @@ spec:
 apiVersion: inference.llmkube.dev/v1alpha1
 kind: InferenceService
 metadata:
-  name: glm
+  name: qwen
 spec:
-  modelRef: glm-5-3-flash
+  modelRef: qwen2-5-0-5b-instruct
   runtime: vllm
   modelCache:
     claimName: model-cache
