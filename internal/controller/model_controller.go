@@ -166,6 +166,11 @@ type ModelReconciler struct {
 	// service-requested prefetch (#2136) targets the claim that service's
 	// pods mount (modelCachePVCName), including a perService claim.
 	ModelCacheMode string
+	// ModelCachePath is the InferenceService reconciler's cache path flag;
+	// empty means caching is disabled and no service can consume a
+	// prefetch. StoragePath is the same flag but defaults itself, so it
+	// cannot carry that signal.
+	ModelCachePath string
 
 	// Recorder emits Warning events on the Model (a prefetch held on a
 	// missing CA ConfigMap, a prefetch skipped on an unstageable source).
@@ -1700,7 +1705,11 @@ func (r *ModelReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		// The prefetch Jobs this controller creates: a completion, failure or
 		// deletion (a TTL expiry, or a service asking for a re-stage) is then
 		// a prompt event rather than a poll, and a deleted Job is recreated
-		// as a re-verification of its claim (#2136).
+		// as a re-verification of its claim (#2136). Trade-off against the
+		// lazy read of #1597: the Job informer now starts with the manager,
+		// so a cluster whose RBAC cannot list or watch Jobs fails the cache
+		// sync at startup instead of degrading prefetch alone. The chart has
+		// granted batch/jobs since #1593 and the generated-RBAC e2e covers it.
 		Owns(&batchv1.Job{}).
 		// A service created or retargeted after its Model moves the prefetch
 		// target (#2136). Spec changes only: a service's status writes must

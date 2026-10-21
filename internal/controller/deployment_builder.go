@@ -432,10 +432,15 @@ func (r *InferenceServiceReconciler) servingStorage(
 	// service that declined the cache mounts an emptyDir instead of a claim
 	// nobody created (#1451).
 	useCache := modelWantsCacheVolume(model, isvc, r.ModelCachePath)
-	if r.prefetchSatisfied(isvc, model) {
+	if g := r.prefetchGate(isvc, model); g.applies && g.satisfied {
 		// The weights are already on the claim (#2136): mount it read-only
-		// and verify, rather than run the downloader on the serving node.
-		storageConfig = buildPrefetchedStorageConfig(model, isvc, r.ModelCacheMode, r.InitContainerImage)
+		// and verify the names the Job recorded, rather than run the
+		// downloader on the serving node.
+		var staged []string
+		if g.entry != nil {
+			staged = g.entry.Files
+		}
+		storageConfig = buildPrefetchedStorageConfig(model, effectiveCacheService(isvc, model), r.ModelCacheMode, r.InitContainerImage, staged)
 	} else {
 		storageConfig = buildModelStorageConfig(model, isvc, isvc.Namespace, useCache, r.ModelCacheMode, r.CACertConfigMap, r.InitContainerImage, r.DefaultFSGroup, r.AllowedHostPathRoots, hfEndpoint)
 	}
@@ -601,6 +606,14 @@ func (r *InferenceServiceReconciler) constructDeployment(
 	}
 	mirrorEnv, _ := runtimeHFMirrorEnv(backend, isvc, model, hfEndpoint)
 	container.Env = append(container.Env, mirrorEnv...)
+	// A pod that consumes a prefetched claim has no business on the Hub:
+	// the libraries behind vLLM, SGLang and friends honour these and fail
+	// fast on any path the operator does not model (#2136).
+	if r.prefetchSatisfied(isvc, model) {
+		container.Env = append(container.Env,
+			corev1.EnvVar{Name: "HF_HUB_OFFLINE", Value: "1"},
+			corev1.EnvVar{Name: "TRANSFORMERS_OFFLINE", Value: "1"})
+	}
 	if len(isvc.Spec.Env) > 0 {
 		container.Env = append(container.Env, isvc.Spec.Env...)
 	}

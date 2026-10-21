@@ -642,13 +642,33 @@ func TestTargetedClaims(t *testing.T) {
 		return s
 	}
 
+	modelClaim := purgeTarget{Name: "model-cache", UserOwned: true}
+
 	tests := []struct {
-		name  string
-		all   []purgeTarget
-		svcs  []inferencev1alpha1.InferenceService
-		model string
-		want  []string
+		name       string
+		all        []purgeTarget
+		svcs       []inferencev1alpha1.InferenceService
+		model      string
+		modelClaim string
+		want       []string
 	}{
+		{
+			// #2136: the Model names the claim and the service inherits it;
+			// the service's own spec says nothing.
+			name:       "a Model's claimName is the target with or without a service",
+			all:        []purgeTarget{shared, modelClaim, unrelatedPerService},
+			svcs:       []inferencev1alpha1.InferenceService{svc("glm", "glm", "")},
+			model:      "glm",
+			modelClaim: "model-cache",
+			want:       []string{"model-cache"},
+		},
+		{
+			name:       "a prefetch-era Model with no service targets its own claim, not the shared cache",
+			all:        []purgeTarget{shared, modelClaim},
+			model:      "glm",
+			modelClaim: "model-cache",
+			want:       []string{"model-cache"},
+		},
 		{
 			name:  "claimName override targets the override only",
 			all:   []purgeTarget{shared, overrideClaim, unrelatedPerService},
@@ -720,7 +740,7 @@ func TestTargetedClaims(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := targetedClaims(tt.all, tt.svcs, tt.model)
+			got := targetedClaims(tt.all, tt.svcs, tt.model, tt.modelClaim)
 			var names []string
 			for _, target := range got {
 				names = append(names, target.Name)

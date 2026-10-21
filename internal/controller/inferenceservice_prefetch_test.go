@@ -32,6 +32,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/events"
+	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
@@ -118,6 +119,7 @@ var _ = Describe("InferenceService modelCache.prefetch (#2136)", func() {
 			ModelCacheSize:       "10Gi",
 			ModelCacheAccessMode: "ReadWriteOnce",
 			ModelCacheMode:       ModelCacheModeShared,
+			ModelCachePath:       "/models",
 		}
 	}
 	isvcReconciler := func() *InferenceServiceReconciler {
@@ -263,9 +265,22 @@ var _ = Describe("InferenceService modelCache.prefetch (#2136)", func() {
 		Expect(cond.Status).To(Equal(metav1.ConditionTrue))
 		Expect(cond.Reason).To(Equal(ReasonPrefetchComplete))
 		Expect(got.Status.SchedulingStatus).To(BeEmpty(), "the hold's diagnosis is cleared when the gate opens")
+		Expect(envValue(pod.Containers[0].Env, "HF_HUB_OFFLINE")).To(Equal("1"), "a prefetched pod has no business on the Hub")
+		Expect(envValue(pod.Containers[0].Env, "TRANSFORMERS_OFFLINE")).To(Equal("1"))
+		Expect(findPrefetchStatus(model, "svc-cache").Files).To(Equal([]string{canonicalModelBasename(model)}), "the Job records what it wrote")
 		hash1 := dep.Annotations[AnnotationDesiredTemplateHash]
 		Expect(hash1).NotTo(BeEmpty())
 		key1 := model.Status.CacheKey
+
+		By("serving the name the Job wrote even after GGUF metadata would derive another")
+		model.Status.GGUF = &inferencev1alpha1.GGUFMetadata{ModelName: "Llama Renamed By Metadata"}
+		Expect(k8sClient.Status().Update(ctx, model)).To(Succeed())
+		model, _, _ = prefetchModel(mr, model.Name)
+		Expect(canonicalModelBasename(model)).NotTo(Equal(findPrefetchStatus(model, "svc-cache").Files[0]), "the test needs the derived name to differ")
+		reconcileService(ir, isvc.Name)
+		Expect(k8sClient.Get(ctx, depKey, dep)).To(Succeed())
+		Expect(envValue(dep.Spec.Template.Spec.InitContainers[0].Env, "MODEL_FILES")).To(Equal(findPrefetchStatus(model, "svc-cache").Files[0]))
+		Expect(dep.Annotations[AnnotationDesiredTemplateHash]).To(Equal(hash1), "no rollout for a name the Job never used")
 
 		By("keeping the live Deployment on its template while a new prefetch for a changed source runs")
 		fingerprint1 := findPrefetchStatus(model, "svc-cache").Fingerprint
@@ -361,21 +376,48 @@ var _ = Describe("InferenceService modelCache.prefetch (#2136)", func() {
 			"the prefetch Job is deleted so the Model stages the claim again")
 		Expect(drainEvents(recorder)).To(ContainElement(HavePrefix("Warning " + ReasonPrefetchRestaged)))
 
-		By("the Model re-staging the claim with its Ready untouched")
+		By("the Model re-staging the claim with its Ready and the entry's Succeeded untouched")
 		model, _, _ = prefetchModel(mr, model.Name)
 		Expect(model.Status.Phase).To(Equal(PhaseReady))
 		entry := findPrefetchStatus(model, "wiped-cache")
-		Expect(entry.Phase).To(Equal(inferencev1alpha1.PrefetchPhaseRunning))
+		Expect(entry.Phase).To(Equal(inferencev1alpha1.PrefetchPhaseSucceeded), "consumers are not held for a re-stage")
 		Expect(entry.Message).To(ContainSubstring("re-verifying"))
 		Expect(k8sClient.Get(ctx, jobKey, &batchv1.Job{})).To(Succeed())
 
-		By("leaving the new Job alone for the same failure episode")
+		By("leaving a re-stage in flight alone")
+		reconcileService(ir, isvc.Name)
+		Expect(k8sClient.Get(ctx, jobKey, &batchv1.Job{})).To(Succeed(), "the running re-stage is the remedy, not a stale Job")
+
+		By("leaving the completed re-stage alone for the same failure episode")
 		markJobComplete(ctx, jobKey)
 		model, _, _ = prefetchModel(mr, model.Name)
 		Expect(findPrefetchStatus(model, "wiped-cache").Phase).To(Equal(inferencev1alpha1.PrefetchPhaseSucceeded))
+		Expect(findPrefetchStatus(model, "wiped-cache").Message).To(BeEmpty())
 		reconcileService(ir, isvc.Name)
 		Expect(k8sClient.Get(ctx, jobKey, &batchv1.Job{})).To(Succeed(),
 			"a failure observed before the re-stage completed does not trigger another")
+	})
+
+	// prefetch: true means "serve only from a prefetched cache". A request the
+	// pods could not consume is held and said so, never rolled out with a
+	// downloader on the serving node.
+	It("holds a request the pods could not consume as PrefetchUnsupported", func() {
+		createCachePVC(ctx, ns, "unsup-cache")
+		model := readyModel("unsup-model", "https://example.com/models/llama.gguf", nil)
+		isvc := newService("unsup", model.Name, &inferencev1alpha1.ModelCacheSpec{ClaimName: "unsup-cache", Prefetch: true})
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: isvc.Name, Namespace: ns}, isvc)).To(Succeed())
+		isvc.Spec.Runtime = "tgi"
+		Expect(k8sClient.Update(ctx, isvc)).To(Succeed())
+
+		got := reconcileService(isvcReconciler(), isvc.Name)
+		Expect(apierrors.IsNotFound(k8sClient.Get(ctx, types.NamespacedName{Name: isvc.Name, Namespace: ns}, &appsv1.Deployment{}))).To(BeTrue(),
+			"no pods for a runtime that would download on the serving node")
+		Expect(got.Status.Phase).To(Equal(PhaseFailed))
+		Expect(got.Status.SchedulingStatus).To(Equal(ReasonPrefetchUnsupported))
+		cond := meta.FindStatusCondition(got.Status.Conditions, ConditionModelPrefetched)
+		Expect(cond).NotTo(BeNil())
+		Expect(cond.Reason).To(Equal(ReasonPrefetchUnsupported))
+		Expect(cond.Message).To(ContainSubstring("tgi"))
 	})
 
 	It("reports PrefetchFailed on a first rollout and creates nothing", func() {
@@ -466,7 +508,7 @@ var _ = Describe("buildPrefetchedStorageConfig", func() {
 
 	It("mounts the claim read-only and verifies the staged file set instead of downloading", func() {
 		model := multiFileModel(2)
-		cfg := buildPrefetchedStorageConfig(model, isvc, ModelCacheModeShared, "curl:8.18.0")
+		cfg := buildPrefetchedStorageConfig(model, isvc, ModelCacheModeShared, "curl:8.18.0", nil)
 		key := effectiveModelCacheKey(model)
 		Expect(cfg.modelPath).To(Equal("/models/" + key + "/config.json"))
 		Expect(cfg.stagedDir).To(Equal("/models/" + key))
@@ -487,10 +529,50 @@ var _ = Describe("buildPrefetchedStorageConfig", func() {
 	})
 
 	It("fails closed when the glob expansion is not current for the Model's generation", func() {
-		cfg := buildPrefetchedStorageConfig(multiFileModel(3), isvc, ModelCacheModeShared, "curl:8.18.0")
+		cfg := buildPrefetchedStorageConfig(multiFileModel(3), isvc, ModelCacheModeShared, "curl:8.18.0", nil)
 		Expect(cfg.initContainers).To(HaveLen(1))
 		Expect(strings.Join(cfg.initContainers[0].Command, " ")).To(ContainSubstring("StagedFilesNotCurrent"))
 		Expect(cfg.volumes[0].PersistentVolumeClaim.ReadOnly).To(BeTrue())
+	})
+
+	It("verifies the names the entry recorded over names derived now", func() {
+		multi := multiFileModel(2)
+		cfg := buildPrefetchedStorageConfig(multi, isvc, ModelCacheModeShared, "curl:8.18.0", []string{"config.json", "a.safetensors"})
+		key := effectiveModelCacheKey(multi)
+		Expect(envValue(cfg.initContainers[0].Env, "MODEL_FILES")).To(Equal("config.json\na.safetensors"))
+		Expect(cfg.modelPath).To(Equal("/models/" + key + "/config.json"))
+		Expect(cfg.stagedDir).To(Equal("/models/" + key))
+
+		single := &inferencev1alpha1.Model{
+			ObjectMeta: metav1.ObjectMeta{Name: "llama", Namespace: "default"},
+			Spec:       inferencev1alpha1.ModelSpec{Source: "https://example.com/models/llama.gguf"},
+			Status:     inferencev1alpha1.ModelStatus{CacheKey: "abc123", GGUF: &inferencev1alpha1.GGUFMetadata{ModelName: "Parsed After The Job"}},
+		}
+		cfg = buildPrefetchedStorageConfig(single, nil, ModelCacheModeShared, "curl:8.18.0", []string{"llama.gguf"})
+		Expect(canonicalModelBasename(single)).NotTo(Equal("llama.gguf"))
+		Expect(envValue(cfg.initContainers[0].Env, "MODEL_FILES")).To(Equal("llama.gguf"))
+		Expect(cfg.modelPath).To(Equal("/models/abc123/llama.gguf"))
+		Expect(cfg.stagedDir).To(BeEmpty())
+	})
+
+	It("hashes the primary file against a pinned spec.sha256", func() {
+		model := &inferencev1alpha1.Model{
+			ObjectMeta: metav1.ObjectMeta{Name: "pinned", Namespace: "default"},
+			Spec:       inferencev1alpha1.ModelSpec{Source: "https://example.com/models/llama.gguf", SHA256: strings.Repeat("AB", 32)},
+			Status:     inferencev1alpha1.ModelStatus{CacheKey: "abc123"},
+		}
+		cfg := buildPrefetchedStorageConfig(model, nil, ModelCacheModeShared, "curl:8.18.0", []string{"pinned.gguf"})
+		verify := cfg.initContainers[0]
+		Expect(envValue(verify.Env, "MODEL_SHA256")).To(Equal(strings.Repeat("ab", 32)))
+		Expect(envValue(verify.Env, "MODEL_PATH")).To(Equal("/models/abc123/pinned.gguf"))
+		cmd := strings.Join(verify.Command, " ")
+		Expect(cmd).To(ContainSubstring("llmkube_sha256_hash"))
+		Expect(cmd).To(ContainSubstring("spec.sha256"))
+
+		model.Spec.SHA256 = ""
+		cfg = buildPrefetchedStorageConfig(model, nil, ModelCacheModeShared, "curl:8.18.0", []string{"pinned.gguf"})
+		Expect(envValue(cfg.initContainers[0].Env, "MODEL_SHA256")).To(BeEmpty())
+		Expect(strings.Join(cfg.initContainers[0].Command, " ")).NotTo(ContainSubstring("llmkube_sha256_hash"))
 	})
 
 	It("verifies the canonical basename of a single-file model", func() {
@@ -499,11 +581,74 @@ var _ = Describe("buildPrefetchedStorageConfig", func() {
 			Spec:       inferencev1alpha1.ModelSpec{Source: "https://example.com/models/llama.gguf"},
 			Status:     inferencev1alpha1.ModelStatus{CacheKey: "abc123"},
 		}
-		cfg := buildPrefetchedStorageConfig(model, nil, ModelCacheModeShared, "curl:8.18.0")
+		cfg := buildPrefetchedStorageConfig(model, nil, ModelCacheModeShared, "curl:8.18.0", nil)
 		Expect(cfg.modelPath).To(Equal("/models/abc123/" + canonicalModelBasename(model)))
 		Expect(cfg.stagedDir).To(BeEmpty())
 		Expect(cfg.volumes[0].PersistentVolumeClaim.ClaimName).To(Equal(ModelCachePVCName))
 		Expect(envValue(cfg.initContainers[0].Env, "MODEL_FILES")).To(Equal(canonicalModelBasename(model)))
+	})
+})
+
+var _ = Describe("prefetchGate classification", func() {
+	newModel := func(source string) *inferencev1alpha1.Model {
+		m := &inferencev1alpha1.Model{
+			ObjectMeta: metav1.ObjectMeta{Name: "m", Namespace: "default", Generation: 1},
+			Spec:       inferencev1alpha1.ModelSpec{Source: source},
+			Status:     inferencev1alpha1.ModelStatus{Phase: PhaseReady},
+		}
+		if !isPVCSource(source) {
+			m.Status.CacheKey = computeCacheKey(source)
+		}
+		return m
+	}
+	newService := func(mutate func(*inferencev1alpha1.InferenceService)) *inferencev1alpha1.InferenceService {
+		svc := &inferencev1alpha1.InferenceService{
+			ObjectMeta: metav1.ObjectMeta{Name: "svc", Namespace: "default"},
+			Spec:       inferencev1alpha1.InferenceServiceSpec{ModelRef: "m", ModelCache: &inferencev1alpha1.ModelCacheSpec{ClaimName: "c", Prefetch: true}},
+		}
+		if mutate != nil {
+			mutate(svc)
+		}
+		return svc
+	}
+	reconciler := func(cachePath string) *InferenceServiceReconciler {
+		return &InferenceServiceReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(), ModelCachePath: cachePath, ModelCacheMode: ModelCacheModeShared}
+	}
+	https := "https://example.com/models/llama.gguf"
+
+	// Every case where the pods would still download at serve time is refused
+	// and held, so prefetch: true never rolls out a downloader quietly.
+	DescribeTable("refuses what prefetch cannot cover and passes through what never downloads",
+		func(cachePath, source string, mutate func(*inferencev1alpha1.InferenceService), wantApplies, wantUnsupported bool, wantReason string) {
+			g := reconciler(cachePath).prefetchGate(newService(mutate), newModel(source))
+			Expect(g.requested).To(BeTrue())
+			Expect(g.applies).To(Equal(wantApplies))
+			Expect(g.unsupported).To(Equal(wantUnsupported))
+			Expect(g.reason).To(Equal(wantReason))
+		},
+		Entry("a runtime the operator does not stage", "/models", https, func(s *inferencev1alpha1.InferenceService) { s.Spec.Runtime = "tgi" }, true, true, ReasonPrefetchUnsupported),
+		Entry("skipModelInit", "/models", https, func(s *inferencev1alpha1.InferenceService) {
+			s.Spec.Runtime = "vllm"
+			s.Spec.SkipModelInit = ptr.To(true)
+		}, true, true, ReasonPrefetchUnsupported),
+		Entry("a draft model nobody prefetches", "/models", https, func(s *inferencev1alpha1.InferenceService) {
+			s.Spec.SpeculativeDecoding = &inferencev1alpha1.SpeculativeDecodingSpec{Type: "draft-simple", DraftModelRef: "draft"}
+		}, true, true, ReasonPrefetchUnsupported),
+		Entry("caching disabled on the operator", "", https, nil, true, true, ReasonPrefetchUnsupported),
+		Entry("a source the downloader does not stage ahead of time", "/models", "s3://bucket/llama.gguf", nil, true, true, ReasonPrefetchUnsupported),
+		Entry("a pre-staged pvc:// source", "/models", "pvc://staged/llama.gguf", nil, false, false, ReasonPrefetchNotApplicable),
+		Entry("a stageable source on a staging runtime", "/models", https, nil, true, false, ReasonWaitingForPrefetch),
+	)
+
+	It("resolves the Model's modelCache for a service without its own, without mutating the service", func() {
+		model := newModel(https)
+		model.Spec.ModelCache = &inferencev1alpha1.ModelCacheSpec{ClaimName: "model-cache", Prefetch: true}
+		svc := newService(func(s *inferencev1alpha1.InferenceService) { s.Spec.ModelCache = nil })
+		g := reconciler("/models").prefetchGate(svc, model)
+		Expect(g.requested).To(BeTrue())
+		Expect(g.applies).To(BeTrue())
+		Expect(g.claim).To(Equal("model-cache"))
+		Expect(svc.Spec.ModelCache).To(BeNil(), "the gate reads an effective copy")
 	})
 })
 

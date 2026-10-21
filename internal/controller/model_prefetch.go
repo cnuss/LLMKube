@@ -104,15 +104,22 @@ const (
 	// download has not started. Placement (or the claim's node) is the fix.
 	ReasonPrefetchUnschedulable = "PrefetchUnschedulable"
 	// ReasonPrefetchReverifying: the claim was staged earlier and its Job is
-	// gone, so a new Job checks the files are still there. A cache hit makes
-	// it short; the Model stays Ready meanwhile.
+	// gone, so a new Job checks the files are still there. The entry stays
+	// Succeeded and the Model Ready meanwhile; only a failed check changes
+	// them.
 	ReasonPrefetchReverifying = "PrefetchReverifying"
+	// ReasonPrefetchStalled: the Job's pod was scheduled but has not started
+	// within prefetchPodStartGrace (an image pull, a volume that cannot
+	// attach); the entry names the pod's waiting reason.
+	ReasonPrefetchStalled = "PrefetchStalled"
 )
 
 const (
-	// prefetchPollInterval is how often a running Job is re-read. The
-	// controller does not watch Jobs: a completion generates no Model event.
-	prefetchPollInterval = 15 * time.Second
+	// prefetchPollInterval is the requeue while a Job runs. Its completion,
+	// failure and deletion are events (Owns(Job)); the requeue exists for
+	// what the Job object does not show: a pod that cannot be scheduled or
+	// has not started.
+	prefetchPollInterval = time.Minute
 	// prefetchRetryInterval follows a create race or a replaced Job's
 	// deletion, both of which resolve within seconds.
 	prefetchRetryInterval = 5 * time.Second
@@ -121,6 +128,10 @@ const (
 	// InferenceService controller has not provisioned).
 	prefetchClaimWait = 30 * time.Second
 )
+
+// prefetchPodStartGrace is how long a scheduled Job pod may stay Pending
+// before the entry names it as stalled. A variable so a test can shrink it.
+var prefetchPodStartGrace = 5 * time.Minute
 
 // prefetchJobName returns the Job name for the Model's own prefetch target.
 // It predates per-claim tracking, so a Job a previous controller created is
@@ -205,10 +216,10 @@ func servicePrefetchRequested(isvc *inferencev1alpha1.InferenceService) bool {
 		isvc.Spec.ModelCache.Persistence != inferencev1alpha1.ModelCachePersistenceEphemeral
 }
 
-// DefaultPrefetchJobReadTimeout bounds the read of the prefetch Job. Generous
-// enough that a legitimate first-time informer sync on a cluster with many
-// Jobs completes well inside it, short enough that a permanently unsyncable
-// informer cannot monopolise a reconcile worker (#1597).
+// DefaultPrefetchJobReadTimeout bounds the read of the prefetch Job (#1597).
+// The Job informer now starts with the manager (Owns(Job)), so the lazy sync
+// the bound was written for no longer happens here; it stays as a ceiling on
+// any cache read that cannot complete.
 const DefaultPrefetchJobReadTimeout = 30 * time.Second
 
 // prefetchJobReadTimeout returns the configured bound, or the default.
@@ -255,6 +266,12 @@ func (r *ModelReconciler) prefetchTargets(model *inferencev1alpha1.Model, servic
 	}
 	for _, svc := range services {
 		if !servicePrefetchRequested(svc) {
+			continue
+		}
+		// The same classification the service applies: a request its pods
+		// cannot consume (Metal, caching disabled, a runtime the operator
+		// does not stage) must not fill a claim nobody mounts.
+		if kind, _ := classifyPrefetchRequest(svc, model, r.ModelCachePath); kind != prefetchApplies {
 			continue
 		}
 		add(modelCachePVCName(svc, r.ModelCacheMode), false, svc.Name)
@@ -336,12 +353,14 @@ func (r *ModelReconciler) referencingServices(ctx context.Context, model *infere
 }
 
 // prefetchFingerprint identifies what a prefetch stages: the cache directory
-// (which encodes the source), the staged file set, and any pinned digests. A
-// change to any of these needs a new download; a change to anything else on
-// the Model (placement, tolerations, a label) does not.
+// (which encodes the source), the staged file set, and any pinned digests
+// (spec.sha256, spec.fileSha256). A change to any of these needs a new
+// download; a change to anything else on the Model (placement, tolerations,
+// a label) does not.
 func prefetchFingerprint(model *inferencev1alpha1.Model, plan *StagingPlan) string {
 	h := sha256.New()
 	_, _ = fmt.Fprintf(h, "%s\n", effectiveModelCacheKey(model))
+	_, _ = fmt.Fprintf(h, "sha256=%s\n", strings.ToLower(model.Spec.SHA256))
 	if plan != nil {
 		for _, f := range plan.Files {
 			_, _ = fmt.Fprintf(h, "%s\n", f)
@@ -554,11 +573,23 @@ func (r *ModelReconciler) gateModelOnOwnPrefetch(ctx context.Context, model *inf
 	case inferencev1alpha1.PrefetchPhaseSucceeded:
 		if readyForSpec {
 			// Completed earlier: the cache is warm and status is terminal.
-			// Fall through so the ordinary remote-source reconcile keeps
-			// owning Ready (revalidation, accelerator checks). A
-			// re-verification that just finished leaves Progressing True.
-			if c := meta.FindStatusCondition(model.Status.Conditions, ConditionProgressing); c != nil && c.Status == metav1.ConditionTrue {
-				setCondition(model, ConditionProgressing, metav1.ConditionFalse, ReasonPrefetchComplete, "Prefetch re-verified the claim")
+			// A re-verification in flight shows on Progressing with Ready
+			// untouched; once it is done, Progressing goes back to False.
+			// Either way the ordinary remote-source reconcile keeps owning
+			// Ready (revalidation, accelerator checks).
+			switch outcome.reason {
+			case ReasonPrefetchReverifying, ReasonPrefetchUnschedulable, ReasonPrefetchStalled:
+				meta.SetStatusCondition(&model.Status.Conditions, metav1.Condition{
+					Type:               ConditionProgressing,
+					Status:             metav1.ConditionTrue,
+					ObservedGeneration: model.Generation,
+					Reason:             outcome.reason,
+					Message:            entry.Message,
+				})
+			default:
+				if c := meta.FindStatusCondition(model.Status.Conditions, ConditionProgressing); c != nil && c.Status == metav1.ConditionTrue {
+					setCondition(model, ConditionProgressing, metav1.ConditionFalse, ReasonPrefetchComplete, "Prefetch re-verified the claim")
+				}
 			}
 			return false, ctrl.Result{RequeueAfter: requeue}, nil
 		}
@@ -604,11 +635,11 @@ func (r *ModelReconciler) gateModelOnOwnPrefetch(ctx context.Context, model *inf
 			}
 			setCondition(model, ConditionProgressing, metav1.ConditionTrue, outcome.reason, message)
 		}
-		// A Job that cannot be scheduled is still Downloading, but the
-		// condition carries the scheduler's reason while it lasts, and the
-		// running message once it clears. The transition time moves only
-		// when the status does.
-		if outcome.reason == ReasonPrefetchUnschedulable || progressingReason(model) == ReasonPrefetchUnschedulable {
+		// A Job whose pod cannot be scheduled or has not started is still
+		// Downloading, but the condition carries that reason while it lasts,
+		// and the running message once it clears. The transition time moves
+		// only when the status does.
+		if prefetchBlockedReason(outcome.reason) || prefetchBlockedReason(progressingReason(model)) {
 			meta.SetStatusCondition(&model.Status.Conditions, metav1.Condition{
 				Type:               ConditionProgressing,
 				Status:             metav1.ConditionTrue,
@@ -619,6 +650,12 @@ func (r *ModelReconciler) gateModelOnOwnPrefetch(ctx context.Context, model *inf
 		}
 		return true, ctrl.Result{RequeueAfter: requeue}, nil
 	}
+}
+
+// prefetchBlockedReason reports whether reason names a Job pod that is not
+// progressing (unschedulable, or scheduled and not started).
+func prefetchBlockedReason(reason string) bool {
+	return reason == ReasonPrefetchUnschedulable || reason == ReasonPrefetchStalled
 }
 
 // progressingReason returns the Progressing condition's reason, or "".
@@ -649,14 +686,10 @@ func (r *ModelReconciler) reconcilePrefetchTarget(ctx context.Context, model, jo
 		}
 	}
 
-	// Bounded read. The controller does not watch Jobs, so this is the first
-	// touch of the type and controller-runtime starts the informer lazily and
-	// waits for it to sync. When that informer can never list -- an RBAC
-	// denial like #1593, a partitioned API server -- the reflector retries
-	// forever and an unbounded Get holds the worker. The Model controller's
-	// workers are a shared resource, so that stalls every other Model, not
-	// just this one (#1597). A timeout turns it into a prompt error and an
-	// ordinary backoff requeue, which self-heals once the informer can sync.
+	// Bounded read (#1597). The Job informer starts with the manager now
+	// that the controller owns its Jobs, so the lazy sync this bound was
+	// written for no longer happens here; it stays as a ceiling so no cache
+	// read can hold a shared worker.
 	getCtx, cancel := context.WithTimeout(ctx, r.prefetchJobReadTimeout())
 	defer cancel()
 
@@ -707,60 +740,100 @@ func (r *ModelReconciler) reconcilePrefetchTarget(ctx context.Context, model, jo
 	entry.ObservedGeneration = model.Generation
 	switch {
 	case jobSucceeded(job):
+		// A re-verification that passed is a new staging of the same files:
+		// move the transition time so a failure a service observed before
+		// it (restagePrefetchOnMissingFiles) does not count against it.
+		if job.Annotations[annotationPrefetchReverify] == "true" && entry.Phase == inferencev1alpha1.PrefetchPhaseSucceeded && entry.Message != "" {
+			now := metav1.Now()
+			entry.LastTransitionTime = &now
+		}
 		setPrefetchPhase(entry, inferencev1alpha1.PrefetchPhaseSucceeded, "")
 		return prefetchTargetOutcome{reason: ReasonPrefetchComplete}, nil
 	case jobFailed(job):
 		logger.Info("Prefetch job failed", "job", job.Name, "claim", t.claim)
-		setPrefetchPhase(entry, inferencev1alpha1.PrefetchPhaseFailed,
-			fmt.Sprintf("prefetch job %q failed; see its pod logs", job.Name))
+		message := fmt.Sprintf("prefetch job %q failed; see its pod logs", job.Name)
+		if job.Annotations[annotationPrefetchReverify] == "true" {
+			message = fmt.Sprintf("re-verification of claim %q by prefetch job %q failed; see its pod logs, then delete the Job to retry", t.claim, job.Name)
+		}
+		setPrefetchPhase(entry, inferencev1alpha1.PrefetchPhaseFailed, message)
 		return prefetchTargetOutcome{reason: ReasonPrefetchFailed}, nil
 	default:
-		// Still running: reflect progress and poll. The Job's completion
-		// does not generate a Model event, so a modest requeue keeps the
-		// status honest without watching Jobs from this controller.
+		// Still running. Completion and failure arrive as Job events; the
+		// requeue is for the pod states the Job object does not show.
+		reverify := job.Annotations[annotationPrefetchReverify] == "true"
 		reason := ReasonPrefetchRunning
 		message := fmt.Sprintf("prefetch job %q downloading into %q", job.Name, t.claim)
-		if job.Annotations[annotationPrefetchReverify] == "true" {
+		if reverify {
 			reason, message = ReasonPrefetchReverifying, prefetchReverifyMessage(job.Name, t.claim)
 		}
-		// A Job whose pod cannot be scheduled never completes and never
-		// fails: a placement that keeps the download off the GPU nodes
-		// cannot reach a claim that lives on one of them. Say so rather than
-		// report a download that has not started.
-		if blocked := r.prefetchJobUnschedulable(ctx, job); blocked != "" {
-			reason = ReasonPrefetchUnschedulable
-			message = fmt.Sprintf("prefetch job %q cannot be scheduled: %s. Fix the Model's prefetch placement "+
-				"(prefetchNodeSelector, prefetchTolerations, prefetchAffinity) so the pod can reach claim %q, then delete the Job to retry",
+		// A Job whose pod cannot be scheduled, or was scheduled and never
+		// started (an image pull, a volume that cannot attach), neither
+		// completes nor fails: say so rather than report a download that has
+		// not begun, and name the retry.
+		if blockedReason, blocked := r.prefetchJobBlocked(ctx, job); blocked != "" {
+			reason = blockedReason
+			message = fmt.Sprintf("prefetch job %q %s. Fix the Model's prefetch placement "+
+				"(prefetchNodeSelector, prefetchTolerations, prefetchAffinity) or the claim so the pod can run and reach claim %q, then delete the Job to retry",
 				job.Name, blocked, t.claim)
 			if entry.Message != message && r.Recorder != nil {
-				r.Recorder.Eventf(model, nil, corev1.EventTypeWarning, ReasonPrefetchUnschedulable, "Prefetch", "%s", message)
+				r.Recorder.Eventf(model, nil, corev1.EventTypeWarning, blockedReason, "Prefetch", "%s", message)
 			}
 		}
-		setPrefetchPhase(entry, inferencev1alpha1.PrefetchPhaseRunning, message)
+		// A re-verification leaves the entry Succeeded: the files it checks
+		// are the ones consumers already serve, so nothing is held for it;
+		// only a failed check changes the entry (the Failed branch above).
+		phase := inferencev1alpha1.PrefetchPhaseRunning
+		if reverify && entry.Phase == inferencev1alpha1.PrefetchPhaseSucceeded {
+			phase = inferencev1alpha1.PrefetchPhaseSucceeded
+		}
+		setPrefetchPhase(entry, phase, message)
 		return prefetchTargetOutcome{requeue: prefetchPollInterval, reason: reason}, nil
 	}
 }
 
-// prefetchJobUnschedulable returns the scheduler's message for a Job pod that
-// is Pending and Unschedulable, or "". The pods are read through the cache
-// the InferenceService controller's Pod watch already fills.
-func (r *ModelReconciler) prefetchJobUnschedulable(ctx context.Context, job *batchv1.Job) string {
+// prefetchJobBlocked reports a Job pod that is Pending and cannot be
+// scheduled (the scheduler's message), or was scheduled and has not started
+// within prefetchPodStartGrace (the waiting reason of its first container),
+// as a reason and a description, or "" when the pods are progressing. The
+// pods are read through the cache the InferenceService controller's Pod
+// watch already fills.
+func (r *ModelReconciler) prefetchJobBlocked(ctx context.Context, job *batchv1.Job) (string, string) {
 	pods := &corev1.PodList{}
 	if err := r.List(ctx, pods, client.InNamespace(job.Namespace), client.MatchingLabels{"batch.kubernetes.io/job-name": job.Name}); err != nil {
-		return ""
+		return "", ""
 	}
 	for i := range pods.Items {
 		pod := &pods.Items[i]
 		if pod.Status.Phase != corev1.PodPending {
 			continue
 		}
+		scheduled := false
 		for _, c := range pod.Status.Conditions {
-			if c.Type == corev1.PodScheduled && c.Status == corev1.ConditionFalse && c.Reason == corev1.PodReasonUnschedulable {
-				return c.Message
+			if c.Type != corev1.PodScheduled {
+				continue
+			}
+			if c.Status == corev1.ConditionFalse && c.Reason == corev1.PodReasonUnschedulable {
+				return ReasonPrefetchUnschedulable, "cannot be scheduled: " + c.Message
+			}
+			scheduled = c.Status == corev1.ConditionTrue
+		}
+		if !scheduled || time.Since(pod.CreationTimestamp.Time) < prefetchPodStartGrace {
+			continue
+		}
+		waiting := "no container has started"
+		for _, cs := range append(append([]corev1.ContainerStatus{}, pod.Status.InitContainerStatuses...), pod.Status.ContainerStatuses...) {
+			if cs.State.Waiting != nil {
+				waiting = cs.Name + " is waiting: " + cs.State.Waiting.Reason
+				if cs.State.Waiting.Message != "" {
+					waiting += " (" + cs.State.Waiting.Message + ")"
+				}
+				break
 			}
 		}
+		return ReasonPrefetchStalled, fmt.Sprintf("pod %q has been Pending on node %q for %s after scheduling; %s",
+			pod.Name, pod.Spec.NodeName, time.Since(pod.CreationTimestamp.Time).Round(time.Second), waiting)
 	}
-	return ""
+	return "", ""
 }
 
 // startPrefetchTarget makes sure the target claim exists (the shared cache is
@@ -834,19 +907,22 @@ func (r *ModelReconciler) startPrefetchTarget(ctx context.Context, model, jobMod
 	entry.JobName = job.Name
 	entry.Fingerprint = fingerprint
 	entry.ObservedGeneration = model.Generation
-	reason := ReasonPrefetchStarted
-	message := fmt.Sprintf("prefetch job %q downloading into %q", job.Name, t.claim)
+	entry.Files = prefetchStagedFileNames(jobModel)
 	if reverify {
-		reason, message = ReasonPrefetchReverifying, prefetchReverifyMessage(job.Name, t.claim)
+		// The entry stays Succeeded: consumers keep serving what they have
+		// while the check runs. A failed check moves it to Failed.
+		setPrefetchPhase(entry, inferencev1alpha1.PrefetchPhaseSucceeded, prefetchReverifyMessage(job.Name, t.claim))
+		return prefetchTargetOutcome{requeue: prefetchPollInterval, reason: ReasonPrefetchReverifying}, nil
 	}
-	setPrefetchPhase(entry, inferencev1alpha1.PrefetchPhaseRunning, message)
-	return prefetchTargetOutcome{requeue: prefetchPollInterval, reason: reason}, nil
+	setPrefetchPhase(entry, inferencev1alpha1.PrefetchPhaseRunning,
+		fmt.Sprintf("prefetch job %q downloading into %q", job.Name, t.claim))
+	return prefetchTargetOutcome{requeue: prefetchPollInterval, reason: ReasonPrefetchStarted}, nil
 }
 
 // prefetchReverifyMessage is the entry and condition message while a claim
 // the status already records as filled is checked again.
 func prefetchReverifyMessage(job, claim string) string {
-	return fmt.Sprintf("re-verifying claim %q with prefetch job %q: the earlier job is gone (expired or deleted); a cache hit completes in seconds", claim, job)
+	return fmt.Sprintf("re-verifying claim %q with prefetch job %q: the earlier job is gone (expired or deleted); the entry stays usable, a cache hit completes in seconds", claim, job)
 }
 
 // pruneStalePrefetch drops entries no target wants any more. A Job still

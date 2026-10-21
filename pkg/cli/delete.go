@@ -144,7 +144,8 @@ func runDelete(opts *deleteOptions) error {
 			return fmt.Errorf("deployment deleted, but purging the cache failed: %w; "+
 				"run 'llmkube cache clear -n %s' to clear what remains", cacheResolveErr, opts.namespace)
 		}
-		targets := targetedClaims(cacheTargets, cacheSvcs, opts.name)
+		modelClaim := modelOwnCacheClaim(ctx, k8sClient, opts.namespace, opts.name)
+		targets := targetedClaims(cacheTargets, cacheSvcs, opts.name, modelClaim)
 		var owned, purged []purgeTarget
 		for _, target := range targets {
 			// The operator garbage-collects a claim owner-ref'd to the service

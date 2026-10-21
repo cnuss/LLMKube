@@ -292,13 +292,23 @@ With the field set:
   workload stays as it was; delete the Job to retry.
 - Once staged, the serving pods only consume the cache: the claim is
   mounted read-only, there is no `model-cache-prep` or `model-downloader`
-  init container, and a `model-verify` init container checks the staged
-  files are present. If one is missing the pod fails with
+  init container, and a `model-verify` init container checks the files the
+  Job recorded on the entry are present (and hashes a single file against
+  `spec.sha256` when one is pinned). If a file is missing the pod fails with
   `PrefetchedFilesMissing` (surfaced on the `ModelTransferHealthy`
-  condition) rather than downloading on the serving node.
-- The field is reported as `PrefetchNotApplicable`, and not waited for, on
-  Metal, when model caching is disabled on the operator, and for sources the
-  downloader does not stage.
+  condition) rather than downloading on the serving node. The pods also get
+  `HF_HUB_OFFLINE=1` and `TRANSFORMERS_OFFLINE=1`, so a runtime cannot reach
+  the Hub through a path the operator does not model.
+- `prefetch: true` means "serve only from a prefetched cache". A request the
+  pods could not consume is refused, not ignored: the service reports
+  `ModelPrefetched=False` with reason `PrefetchUnsupported`, creates no pods
+  (or keeps its live Deployment as it is), and no Job runs. That covers
+  model caching disabled on the operator, a runtime the operator does not
+  stage (TGI, `generic` without `stageModel`, `skipModelInit: true`), a
+  `speculativeDecoding.draftModelRef` (the draft is not prefetched), and a
+  source the downloader does not stage ahead of time (`s3://`). The field
+  is `PrefetchNotApplicable`, and not waited for, only where nothing
+  downloads at serve time: Metal, `pvc://`, `oci://` and local sources.
 
 Applied together by GitOps, the pair above is safe in either order: the
 Model names the claim, the service inherits or repeats it, and the service
@@ -343,7 +353,10 @@ mount). A Job whose pod cannot be scheduled never completes and never fails:
 the Model stays `Downloading`, its `status.prefetch` entry and `Progressing`
 condition carry the scheduler's message (reason `PrefetchUnschedulable`, for
 example `volume node affinity conflict`), and a `PrefetchUnschedulable`
-warning event is recorded. Fix the placement, then delete the Job to retry.
+warning event is recorded. A pod that was scheduled but has not started
+within five minutes (an image pull, a volume that cannot attach) is reported
+the same way as `PrefetchStalled`, with the container's waiting reason. Fix
+the placement or the claim, then delete the Job to retry.
 
 Limitations:
 
@@ -380,9 +393,11 @@ without a rollout:
   rather than re-staged in a loop.
 - The Model re-verifies a claim whenever its prefetch Job is gone: a day
   after it finished (the Job's TTL), or when someone deletes it. With the
-  files still in place that is a cache hit and completes in seconds; the
-  Model stays `Ready` meanwhile and the entry reads `Running` with a
-  re-verification message. So "delete the Job" is always an available
+  files still in place that is a cache hit and completes in seconds. The
+  entry stays `Succeeded` and the Model `Ready` while the check runs, so no
+  service is held for it; the entry's message and the Model's `Progressing`
+  condition (reason `PrefetchReverifying`) show it, and only a failed check
+  moves the entry to `Failed`. So "delete the Job" is always an available
   retry, and a wiped claim is refilled within a day even with no pods to
   notice.
 

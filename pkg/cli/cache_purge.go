@@ -120,7 +120,13 @@ type purgeTarget struct {
 // model stay untouched, so clearing one model does not create a read-write pod
 // on every running service's volume or fail on their attach timeouts. all is
 // every cache claim in the namespace, in the order cachePVCandidates returns.
-func targetedClaims(all []purgeTarget, svcs []inferencev1alpha1.InferenceService, modelName string) []purgeTarget {
+//
+// modelClaim is the Model's own spec.modelCache.claimName: the prefetch
+// target when set, whether or not a service exists yet, so a prefetch-era
+// Model never falls back to the shared cache it was not staged into.
+func targetedClaims(
+	all []purgeTarget, svcs []inferencev1alpha1.InferenceService, modelName, modelClaim string,
+) []purgeTarget {
 	exists := make(map[string]bool, len(all))
 	for _, target := range all {
 		exists[target.Name] = true
@@ -128,6 +134,10 @@ func targetedClaims(all []purgeTarget, svcs []inferencev1alpha1.InferenceService
 
 	own := map[string]bool{}
 	consulted := false
+	if modelClaim != "" {
+		own[modelClaim] = true
+		consulted = true
+	}
 	for i := range svcs {
 		svc := &svcs[i]
 		if svc.Name != modelName && svc.Spec.ModelRef != modelName {
@@ -138,7 +148,13 @@ func targetedClaims(all []purgeTarget, svcs []inferencev1alpha1.InferenceService
 		// the operator gives it a per-service claim only in perService mode,
 		// which is the mode whose claim exists here; otherwise its pods mount
 		// the shared cache.
-		if claim := userModelCacheClaimName(svc); claim != "" {
+		// A service with a claimName override mounts that claim; one with no
+		// block of its own mounts the Model's claim when the Model names one.
+		claim := userModelCacheClaimName(svc)
+		if claim == "" {
+			claim = modelClaim
+		}
+		if claim != "" {
 			own[claim] = true
 			continue
 		}
@@ -531,7 +547,7 @@ func cachePVCandidates(
 	if err != nil {
 		return nil, nil, err
 	}
-	svcs, err := modelServices(ctx, k8sClient, namespace)
+	svcs, models, err := modelServices(ctx, k8sClient, namespace)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -549,9 +565,12 @@ func cachePVCandidates(
 		add(info.Name)
 	}
 	// User-owned claims are outside the discovery label contract, so they only
-	// appear through the service spec.
+	// appear through the service spec, or the Model's.
 	for i := range svcs {
 		add(userModelCacheClaimName(&svcs[i]))
+	}
+	for i := range models {
+		add(modelCacheClaimName(&models[i]))
 	}
 
 	sort.Strings(candidates)
@@ -559,15 +578,54 @@ func cachePVCandidates(
 }
 
 // modelServices returns every InferenceService in namespace, which carries the
-// claims a purge may target beyond the label-discovered ones.
+// claims a purge may target beyond the label-discovered ones, and every Model.
+// A service with no modelCache block of its own resolves its Model's, as the
+// controller does (Model.spec.modelCache is the default for the services that
+// reference it); the copy is in memory only.
 func modelServices(
 	ctx context.Context, k8sClient client.Client, namespace string,
-) ([]inferencev1alpha1.InferenceService, error) {
+) ([]inferencev1alpha1.InferenceService, []inferencev1alpha1.Model, error) {
 	list := &inferencev1alpha1.InferenceServiceList{}
 	if err := k8sClient.List(ctx, list, client.InNamespace(namespace)); err != nil {
-		return nil, fmt.Errorf("failed to list InferenceServices: %w", err)
+		return nil, nil, fmt.Errorf("failed to list InferenceServices: %w", err)
 	}
-	return list.Items, nil
+	models := &inferencev1alpha1.ModelList{}
+	if err := k8sClient.List(ctx, models, client.InNamespace(namespace)); err != nil {
+		return nil, nil, fmt.Errorf("failed to list Models: %w", err)
+	}
+	byName := make(map[string]*inferencev1alpha1.Model, len(models.Items))
+	for i := range models.Items {
+		byName[models.Items[i].Name] = &models.Items[i]
+	}
+	for i := range list.Items {
+		svc := &list.Items[i]
+		if svc.Spec.ModelCache != nil {
+			continue
+		}
+		if m, ok := byName[svc.Spec.ModelRef]; ok && m.Spec.ModelCache != nil {
+			svc.Spec.ModelCache = m.Spec.ModelCache.DeepCopy()
+		}
+	}
+	return list.Items, models.Items, nil
+}
+
+// modelCacheClaimName mirrors the controller's helper: the claim a Model names
+// with spec.modelCache.claimName, or "".
+func modelCacheClaimName(model *inferencev1alpha1.Model) string {
+	if model == nil || model.Spec.ModelCache == nil {
+		return ""
+	}
+	return model.Spec.ModelCache.ClaimName
+}
+
+// modelOwnCacheClaim returns the claim the named Model declares with
+// spec.modelCache.claimName, or "" when it declares none or does not exist.
+func modelOwnCacheClaim(ctx context.Context, k8sClient client.Client, namespace, name string) string {
+	model := &inferencev1alpha1.Model{}
+	if err := k8sClient.Get(ctx, client.ObjectKey{Name: name, Namespace: namespace}, model); err != nil {
+		return ""
+	}
+	return modelCacheClaimName(model)
 }
 
 // userModelCacheClaimName mirrors the controller's helper: the claim a service
@@ -592,6 +650,14 @@ func resolvePurgeTargets(
 	for i := range svcs {
 		if claim := userModelCacheClaimName(&svcs[i]); claim != "" {
 			userOwned[claim] = true
+		}
+	}
+	// A Model's own claim is user-owned too, with or without a service.
+	if _, models, err := modelServices(ctx, k8sClient, namespace); err == nil {
+		for i := range models {
+			if claim := modelCacheClaimName(&models[i]); claim != "" {
+				userOwned[claim] = true
+			}
 		}
 	}
 	infos, err := discoverCachePVCs(ctx, k8sClient, namespace)

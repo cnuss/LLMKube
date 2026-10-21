@@ -642,6 +642,7 @@ func main() {
 		ModelCacheClass:      modelCacheClass,
 		ModelCacheAccessMode: modelCacheAccessMode,
 		ModelCacheMode:       modelCacheMode,
+		ModelCachePath:       modelCachePath,
 	}
 	if reconcileTimeout > 0 {
 		modelReconciler.ReconcileDecorator = controller.WithReconcileDeadline(reconcileTimeout, ctrl.Log.WithName("model"))

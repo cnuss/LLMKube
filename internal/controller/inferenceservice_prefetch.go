@@ -67,19 +67,90 @@ const (
 	// the Model's prefetch Job so the claim its pods found empty is filled
 	// again.
 	ReasonPrefetchRestaged = "PrefetchRestaged"
+	// ReasonPrefetchUnsupported: the service asked, its pods would download
+	// at serve time, and prefetch cannot stand in front of that download
+	// (caching disabled, a runtime the operator does not stage, a draft
+	// model, a source the downloader does not stage). The workload is held
+	// rather than rolled out with a downloader: prefetch: true means "serve
+	// only from a prefetched cache".
+	ReasonPrefetchUnsupported = "PrefetchUnsupported"
 )
+
+// prefetchApplicability classifies a service's prefetch request against its
+// Model and the operator. Both controllers use it, so the Model side never
+// stages for a request the service side cannot consume.
+type prefetchApplicability int
+
+const (
+	// prefetchApplies: the pods mount a cache claim the Job can fill.
+	prefetchApplies prefetchApplicability = iota
+	// prefetchNotApplicable: nothing downloads at serve time, so there is
+	// nothing to prefetch and nothing to hold for.
+	prefetchNotApplicable
+	// prefetchUnsupported: the pods would download at serve time and no
+	// prefetch can cover it. The request is refused, not ignored.
+	prefetchUnsupported
+)
+
+// classifyPrefetchRequest is the one place that decides whether a prefetch
+// request can be honoured. isvc must already carry its effective modelCache.
+func classifyPrefetchRequest(isvc *inferencev1alpha1.InferenceService, model *inferencev1alpha1.Model, modelCachePath string) (prefetchApplicability, string) {
+	switch {
+	case isMetalModel(model):
+		return prefetchNotApplicable, "a Metal service mounts no cache claim; the host metal-agent fetches the model itself"
+	case isPVCSource(model.Spec.Source) || isOCISource(model.Spec.Source):
+		return prefetchNotApplicable, fmt.Sprintf("source %q is pre-staged and mounted without a download", model.Spec.Source)
+	case isLocalSource(model.Spec.Source):
+		return prefetchNotApplicable, fmt.Sprintf("source %q is a local path the operator copies; nothing is downloaded on the serving node", model.Spec.Source)
+	case modelCachePath == "":
+		return prefetchUnsupported, "model caching is disabled on the operator (--model-cache-path unset, chart modelCache.enabled=false), so the pods would download into an emptyDir on the serving node"
+	case !operatorStagesModel(isvc, resolveBackend(isvc)):
+		return prefetchUnsupported, fmt.Sprintf("runtime %q fetches the model itself on the serving node (skipModelInit, or a runtime that stages only with spec.stageModel); a prefetched claim cannot be put in front of it", resolveServingRuntime(isvc))
+	case draftModelRefFor(isvc) != "":
+		return prefetchUnsupported, fmt.Sprintf("speculativeDecoding.draftModelRef %q is not prefetched and its downloader would run on the serving node", draftModelRefFor(isvc))
+	case !prefetchableSource(model):
+		return prefetchUnsupported, fmt.Sprintf("source %q is not one the downloader stages ahead of time, so the pods would download it on the serving node", model.Spec.Source)
+	case effectiveModelCacheKey(model) == "":
+		return prefetchUnsupported, fmt.Sprintf("Model %q has no cache key yet; it is derived when the Model reconciles", model.Name)
+	}
+	return prefetchApplies, ""
+}
+
+// resolveServingRuntime names the runtime for messages.
+func resolveServingRuntime(isvc *inferencev1alpha1.InferenceService) string {
+	if isvc.Spec.Runtime == "" {
+		return "llamacpp"
+	}
+	return isvc.Spec.Runtime
+}
 
 // inheritModelCache gives a service with no modelCache block of its own the
 // Model's, in memory only: the claim is declared once on the Model and every
 // referencing service resolves it, while a service that sets its own block
-// keeps it. Both controllers apply this before reading spec.modelCache, so
-// the claim a prefetch targets is the claim the pods mount. The controller
-// never writes an InferenceService spec, so the copy is never persisted.
+// keeps it. The controller never writes an InferenceService spec, so the copy
+// is never persisted.
+//
+// A status write mid-reconcile decodes the server's object back into isvc and
+// drops the block again, so the helpers that read it after such a write go
+// through effectiveCacheService instead of trusting the mutation, and
+// reconcileDeployment re-applies it after its own status writes.
 func inheritModelCache(isvc *inferencev1alpha1.InferenceService, model *inferencev1alpha1.Model) {
 	if isvc == nil || model == nil || isvc.Spec.ModelCache != nil || model.Spec.ModelCache == nil {
 		return
 	}
 	isvc.Spec.ModelCache = model.Spec.ModelCache.DeepCopy()
+}
+
+// effectiveCacheService returns isvc as the cache helpers should read it: the
+// service itself when it has a modelCache block, else a shallow copy carrying
+// the Model's. The copy is never written anywhere.
+func effectiveCacheService(isvc *inferencev1alpha1.InferenceService, model *inferencev1alpha1.Model) *inferencev1alpha1.InferenceService {
+	if isvc == nil || isvc.Spec.ModelCache != nil || model == nil || model.Spec.ModelCache == nil {
+		return isvc
+	}
+	eff := *isvc
+	eff.Spec.ModelCache = model.Spec.ModelCache.DeepCopy()
+	return &eff
 }
 
 // prefetchGate is what a service's modelCache.prefetch resolves to on this
@@ -93,7 +164,11 @@ type prefetchGate struct {
 	// satisfied: the Model's entry for claim is Succeeded and current.
 	satisfied bool
 	// failed: the Model's entry for claim is Failed.
-	failed  bool
+	failed bool
+	// unsupported: the request cannot be honoured and the workload is held.
+	unsupported bool
+	// entry is the Model's record for claim, when there is one.
+	entry   *inferencev1alpha1.PrefetchStatus
 	reason  string
 	message string
 }
@@ -102,25 +177,24 @@ type prefetchGate struct {
 // pods mount. Call after inheritModelCache.
 func (r *InferenceServiceReconciler) prefetchGate(isvc *inferencev1alpha1.InferenceService, model *inferencev1alpha1.Model) prefetchGate {
 	g := prefetchGate{}
+	isvc = effectiveCacheService(isvc, model)
 	if !servicePrefetchRequested(isvc) {
 		return g
 	}
 	g.requested = true
-	switch {
-	case isMetalModel(model):
-		g.reason, g.message = ReasonPrefetchNotApplicable, "a Metal service mounts no cache claim; the host metal-agent fetches the model itself"
-	case !modelNeedsCachePVC(model, isvc, r.ModelCachePath):
-		g.reason, g.message = ReasonPrefetchNotApplicable, "model caching is inactive for this service (operator cache disabled, a pre-staged source, or a model with no cache key); nothing to prefetch into"
-	case !prefetchableSource(model):
-		g.reason, g.message = ReasonPrefetchNotApplicable, fmt.Sprintf("model source %q is not one the downloader stages ahead of time", model.Spec.Source)
-	default:
-		g.applies = true
-	}
-	if !g.applies {
+	switch kind, why := classifyPrefetchRequest(isvc, model, r.ModelCachePath); kind {
+	case prefetchNotApplicable:
+		g.reason, g.message = ReasonPrefetchNotApplicable, why
+		return g
+	case prefetchUnsupported:
+		g.applies, g.unsupported = true, true
+		g.reason, g.message = ReasonPrefetchUnsupported, why+"; the workload is held until the spec changes"
 		return g
 	}
+	g.applies = true
 	g.claim = modelCachePVCName(isvc, r.ModelCacheMode)
 	entry := findPrefetchStatus(model, g.claim)
+	g.entry = entry
 	switch {
 	case entry == nil:
 		g.reason = ReasonWaitingForPrefetch
@@ -224,9 +298,10 @@ func (r *InferenceServiceReconciler) holdForPrefetch(ctx context.Context, isvc *
 		}
 	}
 
-	// Nothing serves yet: no pods until the weights are in place.
+	// Nothing serves yet: no pods until the weights are in place, and none
+	// at all for a request that cannot be honoured.
 	phase := "Pending"
-	if g.failed {
+	if g.failed || g.unsupported {
 		phase = PhaseFailed
 	}
 	log.Info("Not creating the workload until the prefetch completes", "claim", g.claim, "reason", g.reason, "phase", phase)
@@ -272,6 +347,15 @@ func (r *InferenceServiceReconciler) restagePrefetchOnMissingFiles(ctx context.C
 	if !metav1.IsControlledBy(job, model) {
 		return
 	}
+	// A staging already in flight is the remedy, not a stale Job; and one
+	// that finished after the failure was observed has already refilled the
+	// claim. Either way deleting it would only start the download over.
+	if !jobSucceeded(job) && !jobFailed(job) {
+		return
+	}
+	if job.Status.CompletionTime != nil && !cond.LastTransitionTime.After(job.Status.CompletionTime.Time) {
+		return
+	}
 	if err := r.Delete(ctx, job, client.PropagationPolicy(metav1.DeletePropagationBackground)); err != nil && !apierrors.IsNotFound(err) {
 		log.Error(err, "Failed to delete the prefetch job to re-stage", "job", job.Name)
 		return
@@ -289,6 +373,7 @@ func (r *InferenceServiceReconciler) restagePrefetchOnMissingFiles(ctx context.C
 // one this service mounts: its pods download at serve time, which is what
 // the Model's spec.prefetch was meant to avoid.
 func (r *InferenceServiceReconciler) warnPrefetchTargetMismatch(isvc *inferencev1alpha1.InferenceService, model *inferencev1alpha1.Model) {
+	isvc = effectiveCacheService(isvc, model)
 	if r.Recorder == nil || servicePrefetchRequested(isvc) || !modelWantsPrefetch(model) || isMetalModel(model) ||
 		!modelNeedsCachePVC(model, isvc, r.ModelCachePath) {
 		return
@@ -315,10 +400,16 @@ func (r *InferenceServiceReconciler) warnPrefetchTargetMismatch(isvc *inferencev
 // buildPrefetchedStorageConfig renders the storage of a pod whose weights a
 // prefetch Job already staged: the cache claim mounted read-only, at the same
 // paths the download path uses, with a single init container that checks the
-// staged files are present and fails naming the missing one. No cache-prep
-// (the Job prepared the claim) and no downloader: a pod that would download
-// on the serving node is the failure this exists to prevent.
-func buildPrefetchedStorageConfig(model *inferencev1alpha1.Model, isvc *inferencev1alpha1.InferenceService, cacheMode string, initContainerImage string) (cfg modelStorageConfig) {
+// staged files are present (and the primary file's spec.sha256 when one is
+// pinned) and fails naming the cause. No cache-prep (the Job prepared the
+// claim) and no downloader: a pod that would download on the serving node is
+// the failure this exists to prevent.
+//
+// staged is the file list the Job recorded on the Model's entry. It is
+// authoritative over anything derived from the Model now: a single-file
+// name is derived from GGUF metadata the Model may have parsed only after
+// the Job ran, and the Job wrote the name it had then.
+func buildPrefetchedStorageConfig(model *inferencev1alpha1.Model, isvc *inferencev1alpha1.InferenceService, cacheMode string, initContainerImage string, staged []string) (cfg modelStorageConfig) {
 	defer func() { applyInitContainerDiagnostics(cfg.initContainers) }()
 	cacheDir := fmt.Sprintf("/models/%s", effectiveModelCacheKey(model))
 	volumes := []corev1.Volume{{
@@ -346,32 +437,47 @@ func buildPrefetchedStorageConfig(model *inferencev1alpha1.Model, isvc *inferenc
 		stagedDir string
 		files     []string
 	)
-	if plan != nil {
+	switch {
+	case len(staged) > 0:
+		files = staged
+		modelPath = stagedCachePath(cacheDir, staged[0])
+		if plan != nil {
+			stagedDir = cacheDir
+		}
+	case plan != nil:
 		modelPath = stagedCachePath(cacheDir, plan.Primary)
 		stagedDir = cacheDir
 		files = plan.Files
-	} else {
+	default:
 		// The basename the Job's downloader wrote: see buildCachedStorageConfig.
-		basename := canonicalModelBasename(model)
-		if model.Status.Path != "" {
-			basename = filepath.Base(model.Status.Path)
-		}
+		basename := singleFileStagedBasename(model)
 		modelPath = fmt.Sprintf("%s/%s", cacheDir, basename)
 		files = []string{basename}
+	}
+
+	env := []corev1.EnvVar{
+		{Name: "CACHE_DIR", Value: cacheDir},
+		{Name: "MODEL_FILES", Value: strings.Join(files, "\n")},
+		{Name: "MODEL_NAME", Value: model.Name},
+	}
+	// A pinned single-file digest is enforced here as it is on a pvc://
+	// mount (#1979): the downloader that would have checked it did not run
+	// in this pod. Per-file digests of a multi-file set were checked by the
+	// Job as it staged each file.
+	digest := ""
+	if plan == nil && model.Spec.SHA256 != "" {
+		digest = strings.ToLower(model.Spec.SHA256)
+		env = append(env, corev1.EnvVar{Name: "MODEL_PATH", Value: modelPath}, corev1.EnvVar{Name: "MODEL_SHA256", Value: digest})
 	}
 
 	return modelStorageConfig{
 		modelPath: modelPath,
 		stagedDir: stagedDir,
 		initContainers: []corev1.Container{{
-			Name:    "model-verify",
-			Image:   initContainerImage,
-			Command: []string{"sh", "-c", buildPrefetchVerifyCommand()},
-			Env: []corev1.EnvVar{
-				{Name: "CACHE_DIR", Value: cacheDir},
-				{Name: "MODEL_FILES", Value: strings.Join(files, "\n")},
-				{Name: "MODEL_NAME", Value: model.Name},
-			},
+			Name:            "model-verify",
+			Image:           initContainerImage,
+			Command:         []string{"sh", "-c", buildPrefetchVerifyCommand(digest != "")},
+			Env:             env,
 			VolumeMounts:    mounts,
 			SecurityContext: initContainerSecurityContext(isvc),
 		}},
@@ -380,16 +486,44 @@ func buildPrefetchedStorageConfig(model *inferencev1alpha1.Model, isvc *inferenc
 	}
 }
 
+// singleFileStagedBasename is the name the download path writes a
+// single-file Model under: see buildCachedStorageConfig.
+func singleFileStagedBasename(model *inferencev1alpha1.Model) string {
+	if model.Status.Path != "" {
+		return filepath.Base(model.Status.Path)
+	}
+	return canonicalModelBasename(model)
+}
+
+// prefetchStagedFileNames lists what a prefetch Job built from jobModel
+// writes under the cache key, primary first: the staging plan's files, or
+// the single-file basename.
+func prefetchStagedFileNames(jobModel *inferencev1alpha1.Model) []string {
+	if plan, err := modelStagingPlan(jobModel); err == nil && plan != nil {
+		return append([]string(nil), plan.Files...)
+	}
+	return []string{singleFileStagedBasename(jobModel)}
+}
+
 // buildPrefetchVerifyCommand checks every staged file is present on the
-// read-only cache mount. The file list and the Model name arrive through env
-// and are printed as printf arguments, never interpolated into the shell. The
-// loop runs in a pipeline subshell, so a missing file exits that subshell and
-// the trailing `|| exit 1` fails the container.
-func buildPrefetchVerifyCommand() string {
-	return `printf '%s\n' "$MODEL_FILES" | while IFS= read -r rel; do ` +
+// read-only cache mount, and with verifyDigest hashes the primary file
+// against MODEL_SHA256 as buildPVCVerifyCommand does (no stamp: the mount is
+// read-only). The file list and the Model name arrive through env and are
+// printed as printf arguments, never interpolated into the shell. The loop
+// runs in a pipeline subshell, so a missing file exits that subshell and the
+// trailing `|| exit 1` fails the container.
+func buildPrefetchVerifyCommand(verifyDigest bool) string {
+	cmd := `printf '%s\n' "$MODEL_FILES" | while IFS= read -r rel; do ` +
 		`[ -n "$rel" ] || continue; ` +
 		`if [ ! -f "$CACHE_DIR/$rel" ]; then ` +
 		`printf 'ERROR: PrefetchedFilesMissing - %s is not on the cache claim. Model %s was expected to be staged there by its prefetch job (see the Model status.prefetch); not downloading on the serving node.\n' "$CACHE_DIR/$rel" "$MODEL_NAME" >&2; ` +
-		`exit 1; fi; done || exit 1; ` +
-		`echo "Prefetched model files present under $CACHE_DIR"`
+		`exit 1; fi; done || exit 1; `
+	if verifyDigest {
+		cmd = sha256HashFns + cmd +
+			`llmkube_precheck_sha256 || exit 1; ` +
+			`actual=$(llmkube_sha256_hash "$MODEL_PATH") || exit 1; ` +
+			`if [ "$actual" != "$MODEL_SHA256" ]; then echo "ERROR: SHA256 mismatch for the prefetched $MODEL_PATH: expected $MODEL_SHA256, computed $actual" >&2; exit 1; fi; ` +
+			`echo "Prefetched model verified against spec.sha256"; `
+	}
+	return cmd + `echo "Prefetched model files present under $CACHE_DIR"`
 }

@@ -996,6 +996,9 @@ func (r *InferenceServiceReconciler) reconcileDeployment(ctx context.Context, is
 			},
 		}
 		rollResult, err := r.reconcileRolloutPolicy(ctx, isvc, svc)
+		// Its status writes decoded the stored spec back into isvc, which
+		// drops an inherited modelCache (#2136).
+		inheritModelCache(isvc, model)
 		if err != nil {
 			log.Error(err, "Failed to reconcile rollout policy")
 			return nil, replicaCounts{}, nil, nil, err
@@ -1019,6 +1022,7 @@ func (r *InferenceServiceReconciler) reconcileDeployment(ctx context.Context, is
 				log.Error(updateErr, "Failed to clear stale RolloutDeferred condition")
 				return nil, replicaCounts{}, nil, nil, updateErr
 			}
+			inheritModelCache(isvc, model)
 		}
 	}
 

@@ -519,6 +519,15 @@ type PrefetchStatus struct {
 	// +optional
 	Fingerprint string `json:"fingerprint,omitempty"`
 
+	// Files are the cache-relative names the Job staged under cacheKey, in
+	// staging order with the primary file first. A pod that consumes the
+	// prefetched claim verifies and serves exactly these, so a later change
+	// in how a name would be derived (GGUF metadata parsed after the Job
+	// ran) cannot make it look for a file the Job wrote under another name.
+	// +listType=atomic
+	// +optional
+	Files []string `json:"files,omitempty"`
+
 	// ObservedGeneration is the Model generation the entry was last
 	// confirmed against. A consumer treats an entry whose generation trails
 	// the Model's as not yet current.

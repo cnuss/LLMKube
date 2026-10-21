@@ -437,7 +437,7 @@ func runCacheClear(opts *cacheClearOptions) error {
 	if len(keys) > 0 {
 		// A named model's files live on the claim its own InferenceService
 		// mounts, not on every cache claim in the namespace.
-		targets = targetedClaims(targets, svcs, opts.model)
+		targets = targetedClaims(targets, svcs, opts.model, modelOwnCacheClaim(ctx, k8sClient, opts.namespace, opts.model))
 	} else {
 		// The namespace-wide modes act on what `cache list` discovers. A
 		// user's claimName is not a discovery target: it may be mounted by an

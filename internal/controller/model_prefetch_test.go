@@ -18,6 +18,7 @@ package controller
 
 import (
 	"context"
+	"strings"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -48,6 +49,7 @@ var _ = Describe("Model Prefetch", func() {
 			ModelCacheSize:       "10Gi",
 			ModelCacheAccessMode: "ReadWriteOnce",
 			ModelCacheMode:       ModelCacheModeShared,
+			ModelCachePath:       "/models",
 		}
 	}
 
@@ -242,7 +244,7 @@ var _ = Describe("Model Prefetch", func() {
 			handled, result, err := r.reconcilePrefetch(ctx, model)
 			Expect(err).NotTo(HaveOccurred())
 			Expect(handled).To(BeTrue())
-			Expect(result.RequeueAfter).To(Equal(15 * time.Second))
+			Expect(result.RequeueAfter).To(Equal(prefetchPollInterval))
 
 			job := &batchv1.Job{}
 			jobKey := types.NamespacedName{Name: "model-prefetch-flow-prefetch", Namespace: ns}
@@ -270,7 +272,7 @@ var _ = Describe("Model Prefetch", func() {
 			handled, result, err = r.reconcilePrefetch(ctx, updated)
 			Expect(err).NotTo(HaveOccurred())
 			Expect(handled).To(BeTrue())
-			Expect(result.RequeueAfter).To(Equal(15 * time.Second))
+			Expect(result.RequeueAfter).To(Equal(prefetchPollInterval))
 
 			// Mark the Job complete; next pass promotes the Model to Ready.
 			completeJob(jobKey)
@@ -439,11 +441,11 @@ var _ = Describe("Model Prefetch", func() {
 			Expect(k8sClient.Get(ctx, modelKey, model)).To(Succeed())
 			handled, result, err := r.reconcilePrefetch(ctx, model)
 			Expect(err).NotTo(HaveOccurred())
-			Expect(handled).To(BeTrue())
+			Expect(handled).To(BeFalse(), "a Ready Model keeps its ordinary reconcile during a re-verification")
 			Expect(result.RequeueAfter).To(Equal(prefetchPollInterval))
 			Expect(k8sClient.Get(ctx, modelKey, model)).To(Succeed())
 			Expect(model.Status.Phase).To(Equal(PhaseReady), "a re-verification does not take Ready away")
-			Expect(model.Status.Prefetch[0].Phase).To(Equal(inferencev1alpha1.PrefetchPhaseRunning))
+			Expect(model.Status.Prefetch[0].Phase).To(Equal(inferencev1alpha1.PrefetchPhaseSucceeded), "consumers are not held for a re-verification")
 			Expect(model.Status.Prefetch[0].Message).To(ContainSubstring("re-verifying"))
 			progressing := meta.FindStatusCondition(model.Status.Conditions, ConditionProgressing)
 			Expect(progressing).NotTo(BeNil())
@@ -462,6 +464,8 @@ var _ = Describe("Model Prefetch", func() {
 			Expect(meta.FindStatusCondition(model.Status.Conditions, ConditionProgressing).Reason).To(Equal(ReasonPrefetchReverifying))
 
 			By("the check completing")
+			stagedAt := model.Status.Prefetch[0].LastTransitionTime
+			time.Sleep(1100 * time.Millisecond)
 			completeJob(jobKey)
 			Expect(k8sClient.Get(ctx, modelKey, model)).To(Succeed())
 			handled, _, err = r.reconcilePrefetch(ctx, model)
@@ -470,9 +474,62 @@ var _ = Describe("Model Prefetch", func() {
 			Expect(k8sClient.Get(ctx, modelKey, model)).To(Succeed())
 			Expect(model.Status.Phase).To(Equal(PhaseReady))
 			Expect(model.Status.Prefetch[0].Phase).To(Equal(inferencev1alpha1.PrefetchPhaseSucceeded))
+			Expect(model.Status.Prefetch[0].Message).To(BeEmpty())
+			Expect(model.Status.Prefetch[0].LastTransitionTime.After(stagedAt.Time)).To(BeTrue(), "a passed check is a new staging")
 			progressing = meta.FindStatusCondition(model.Status.Conditions, ConditionProgressing)
 			Expect(progressing.Status).To(Equal(metav1.ConditionFalse))
 			Expect(progressing.Reason).To(Equal(ReasonPrefetchComplete))
+
+			By("a failed check moving the entry to Failed")
+			Expect(k8sClient.Delete(ctx, &batchv1.Job{ObjectMeta: metav1.ObjectMeta{Name: jobKey.Name, Namespace: ns}},
+				client.PropagationPolicy(metav1.DeletePropagationBackground))).To(Succeed())
+			Eventually(func() bool {
+				return apierrors.IsNotFound(k8sClient.Get(ctx, jobKey, &batchv1.Job{}))
+			}, 10*time.Second, 200*time.Millisecond).Should(BeTrue())
+			Expect(k8sClient.Get(ctx, modelKey, model)).To(Succeed())
+			_, _, err = r.reconcilePrefetch(ctx, model)
+			Expect(err).NotTo(HaveOccurred())
+			failJob(jobKey)
+			Expect(k8sClient.Get(ctx, modelKey, model)).To(Succeed())
+			_, _, err = r.reconcilePrefetch(ctx, model)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(k8sClient.Get(ctx, modelKey, model)).To(Succeed())
+			Expect(model.Status.Prefetch[0].Phase).To(Equal(inferencev1alpha1.PrefetchPhaseFailed))
+			Expect(model.Status.Prefetch[0].Message).To(ContainSubstring("re-verification"))
+		})
+
+		It("names a scheduled pod that has not started as stalled", func() {
+			model := newPrefetchModel("model-prefetch-stalled")
+			Expect(k8sClient.Create(ctx, model)).To(Succeed())
+			defer func() { _ = k8sClient.Delete(ctx, model) }()
+			modelKey := types.NamespacedName{Name: model.Name, Namespace: ns}
+			jobName := prefetchJobName(model)
+			r := prefetchReconciler()
+			_, _, err := r.reconcilePrefetch(ctx, model)
+			Expect(err).NotTo(HaveOccurred())
+
+			previous := prefetchPodStartGrace
+			prefetchPodStartGrace = 0
+			defer func() { prefetchPodStartGrace = previous }()
+			pod := &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{Name: jobName + "-stuck", Namespace: ns, Labels: map[string]string{"batch.kubernetes.io/job-name": jobName}},
+				Spec:       corev1.PodSpec{NodeName: "worker-1", Containers: []corev1.Container{{Name: "x", Image: "busybox"}}},
+			}
+			Expect(k8sClient.Create(ctx, pod)).To(Succeed())
+			defer func() { _ = k8sClient.Delete(ctx, pod) }()
+			pod.Status.Phase = corev1.PodPending
+			pod.Status.Conditions = []corev1.PodCondition{{Type: corev1.PodScheduled, Status: corev1.ConditionTrue}}
+			pod.Status.InitContainerStatuses = []corev1.ContainerStatus{{Name: "model-cache-prep", State: corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{
+				Reason: "ContainerCreating", Message: "Multi-Attach error for volume pvc-1: Volume is already used by pod(s) serving-0"}}}}
+			Expect(k8sClient.Status().Update(ctx, pod)).To(Succeed())
+
+			Expect(k8sClient.Get(ctx, modelKey, model)).To(Succeed())
+			_, _, err = r.reconcilePrefetch(ctx, model)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(k8sClient.Get(ctx, modelKey, model)).To(Succeed())
+			Expect(model.Status.Prefetch[0].Message).To(ContainSubstring("has been Pending"))
+			Expect(model.Status.Prefetch[0].Message).To(ContainSubstring("Multi-Attach"))
+			Expect(meta.FindStatusCondition(model.Status.Conditions, ConditionProgressing).Reason).To(Equal(ReasonPrefetchStalled))
 		})
 
 		// The Job name is deterministic, so a user's Job can sit at it. It is
@@ -616,7 +673,7 @@ var _ = Describe("Model Prefetch", func() {
 				NamespacedName: types.NamespacedName{Name: model.Name, Namespace: ns},
 			})
 			Expect(err).NotTo(HaveOccurred())
-			Expect(result.RequeueAfter).To(Equal(15 * time.Second))
+			Expect(result.RequeueAfter).To(Equal(prefetchPollInterval))
 
 			job := &batchv1.Job{}
 			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "model-prefetch-hook-prefetch", Namespace: ns}, job)).To(Succeed())
@@ -1023,6 +1080,44 @@ var _ = Describe("Model Prefetch", func() {
 			ok.Spec.ModelCache = &inferencev1alpha1.ModelCacheSpec{ClaimName: "model-cache", Prefetch: true}
 			Expect(k8sClient.Create(ctx, ok)).To(Succeed())
 			Expect(k8sClient.Delete(ctx, ok)).To(Succeed())
+		})
+	})
+
+	Describe("prefetchTargets", func() {
+		It("skips a service request its pods could not consume", func() {
+			r := prefetchReconciler()
+			m := newPrefetchModel("targets-model")
+			m.Spec.Prefetch = false
+			seedPrefetchCacheKey(m)
+			svc := func(name, runtime string) *inferencev1alpha1.InferenceService {
+				return &inferencev1alpha1.InferenceService{
+					ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
+					Spec: inferencev1alpha1.InferenceServiceSpec{ModelRef: m.Name, Runtime: runtime,
+						ModelCache: &inferencev1alpha1.ModelCacheSpec{ClaimName: name + "-cache", Prefetch: true}},
+				}
+			}
+			targets, _ := r.prefetchTargets(m, []*inferencev1alpha1.InferenceService{svc("tgi-svc", "tgi"), svc("llama-svc", "")}, nil, "")
+			claims := make([]string, 0, len(targets))
+			for _, t := range targets {
+				claims = append(claims, t.claim)
+			}
+			Expect(claims).To(Equal([]string{"llama-svc-cache"}), "a runtime the operator does not stage gets no Job")
+
+			r.ModelCachePath = ""
+			targets, _ = r.prefetchTargets(m, []*inferencev1alpha1.InferenceService{svc("llama-svc", "")}, nil, "")
+			Expect(targets).To(BeEmpty(), "with caching disabled no claim is ever mounted")
+		})
+	})
+
+	Describe("prefetchFingerprint", func() {
+		It("changes with a pinned spec.sha256", func() {
+			m := newPrefetchModel("fp-model")
+			seedPrefetchCacheKey(m)
+			before := prefetchFingerprint(m, nil)
+			m.Spec.SHA256 = strings.Repeat("ab", 32)
+			Expect(prefetchFingerprint(m, nil)).NotTo(Equal(before))
+			m.Spec.PrefetchTolerations = []corev1.Toleration{{Key: "x", Operator: corev1.TolerationOpExists}}
+			Expect(prefetchFingerprint(m, nil)).To(Equal(prefetchFingerprint(m, nil)))
 		})
 	})
 
