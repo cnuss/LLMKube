@@ -259,6 +259,68 @@ func TestRunDelete_PurgeSharedClaimOnDefaultInstall(t *testing.T) {
 	}
 }
 
+// TestRunDelete_PurgeTargetsClaimDeclaredOnModel pins the GitOps shape: the
+// claim is declared on the Model, the service inherits it, and the Model is
+// gone by the time the purge runs, so its claim must be read before the
+// delete or the purge lands on the shared cache and leaves the files behind.
+func TestRunDelete_PurgeTargetsClaimDeclaredOnModel(t *testing.T) {
+	const (
+		namespace = "default"
+		modelName = "qwen"
+	)
+	key := cachekey.Compute("hf://org/qwen")
+
+	model := &inferencev1alpha1.Model{
+		ObjectMeta: metav1.ObjectMeta{Name: modelName, Namespace: namespace},
+		Spec: inferencev1alpha1.ModelSpec{
+			Source:     "hf://org/qwen",
+			Files:      []string{"model.gguf"},
+			ModelCache: &inferencev1alpha1.ModelCacheSpec{ClaimName: "model-claim"},
+		},
+	}
+	isvc := &inferencev1alpha1.InferenceService{
+		ObjectMeta: metav1.ObjectMeta{Name: "chat-api", Namespace: namespace},
+		Spec:       inferencev1alpha1.InferenceServiceSpec{ModelRef: modelName},
+	}
+	shared := &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      modelCachePVCName,
+			Namespace: namespace,
+			Labels:    map[string]string{modelCacheLabel: modelCacheLabelValue},
+		},
+	}
+	modelClaim := &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{Name: "model-claim", Namespace: namespace},
+	}
+
+	crClient := fake.NewClientBuilder().WithScheme(newCLIScheme()).WithObjects(model, isvc, shared, modelClaim).Build()
+	clientset := fakeclientset.NewClientset()
+	stubDeleteSeams(t, crClient, clientset)
+
+	var cmds [][]string
+	fakePurgeExec(t, func(command []string) (string, error) {
+		if len(command) < 3 || command[1] != "-c" {
+			return "", nil
+		}
+		return "removed /models/" + key + "\n", nil
+	}, &cmds)
+
+	if err := runDelete(&deleteOptions{name: modelName, namespace: namespace, purgeCache: true}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	var purged []string
+	for _, action := range clientset.Actions() {
+		if action.GetVerb() == "create" && action.GetResource().Resource == "pods" {
+			purged = append(purged, action.(k8stesting.CreateAction).GetObject().(*corev1.Pod).Name)
+		}
+	}
+	if want := purgePodName("model-claim"); len(purged) != 1 || purged[0] != want {
+		t.Errorf("purge pods = %v, want only %s (the claim the Model declared, read before the Model was deleted)",
+			purged, want)
+	}
+}
+
 // TestRunDelete_SkipsClaimCollectedWithService pins perService mode: the
 // per-service claim is owner-ref'd to the InferenceService, so garbage
 // collection removes it, and a pod mounting a terminating claim never

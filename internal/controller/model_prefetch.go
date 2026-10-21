@@ -590,7 +590,7 @@ func (r *ModelReconciler) gateModelOnOwnPrefetch(ctx context.Context, model *inf
 			return false, ctrl.Result{RequeueAfter: requeue}, nil
 		}
 		r.completePrefetch(ctx, model, plan)
-		return true, ctrl.Result{}, nil
+		return true, ctrl.Result{RequeueAfter: requeue}, nil
 	case inferencev1alpha1.PrefetchPhasePending, inferencev1alpha1.PrefetchPhaseRunning:
 		if readyForSpec {
 			// A re-verification, or a hold that followed one: the files this
@@ -610,7 +610,7 @@ func (r *ModelReconciler) gateModelOnOwnPrefetch(ctx context.Context, model *inf
 	case inferencev1alpha1.PrefetchPhaseFailed:
 		model.Status.Phase = PhaseFailed
 		setCondition(model, ConditionProgressing, metav1.ConditionFalse, ReasonPrefetchFailed, entry.Message)
-		return true, ctrl.Result{}, nil
+		return true, ctrl.Result{RequeueAfter: requeue}, nil
 	case inferencev1alpha1.PrefetchPhasePending:
 		model.Status.Phase = "Pending"
 		reason := outcome.reason
@@ -699,6 +699,11 @@ func (r *ModelReconciler) reconcilePrefetchTarget(ctx context.Context, model, jo
 		// fail either way, and the message names what frees the claim.
 		if staged && !r.restageRequested(services, t.claim) {
 			if pod, mode := r.singleWriterClaimHolder(ctx, model.Namespace, t.claim); pod != "" {
+				// The claim holds what this fingerprint describes, so the
+				// generation is confirmed without a Job, as it is when the
+				// Job still exists.
+				entry.Fingerprint = fingerprint
+				entry.ObservedGeneration = model.Generation
 				setPrefetchPhase(entry, inferencev1alpha1.PrefetchPhaseSucceeded,
 					fmt.Sprintf("re-verification of claim %q waits: the claim is %s and mounted by pod %q, so a check job could only run on that pod's node; it runs once the claim is free", t.claim, mode, pod))
 				return prefetchTargetOutcome{requeue: prefetchReverifyRetry, reason: ReasonPrefetchComplete}, nil
@@ -925,13 +930,24 @@ func (r *ModelReconciler) startPrefetchTarget(ctx context.Context, model, jobMod
 		}
 	}
 
-	// The names this Job writes. A re-verification keeps the entry's
-	// recorded names, which consumers serve; names that differ from them
-	// mean the Job writes new files, so that is a fresh staging consumers
+	// The names this Job writes. A re-verification checks the entry's
+	// recorded names, which consumers serve: for a single file the Job is
+	// pointed at that name whatever the metadata would derive now (the
+	// storage builder reads the basename of Status.Path); a plan whose
+	// names differ writes new files, which is a fresh staging consumers
 	// wait for, not a check of what they already have.
-	names := prefetchStagedFileNames(jobModel)
+	plan, planErr := modelStagingPlan(jobModel)
+	if planErr != nil {
+		plan = nil
+	}
+	names := stagedFileNamesFromPlan(jobModel, plan)
 	if reverify && len(entry.Files) > 0 && !slices.Equal(names, entry.Files) {
-		reverify = false
+		if plan == nil && len(entry.Files) == 1 {
+			jobModel.Status.Path = entry.Files[0]
+			names = append([]string(nil), entry.Files...)
+		} else {
+			reverify = false
+		}
 	}
 
 	job, err := r.buildPrefetchJob(ctx, jobModel, t.claim, fingerprint)

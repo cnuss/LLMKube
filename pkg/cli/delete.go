@@ -94,14 +94,17 @@ func runDelete(opts *deleteOptions) error {
 	var cacheTargets []purgeTarget
 	var cacheSvcs []inferencev1alpha1.InferenceService
 	var cacheResolveErr error
+	var modelClaim string
 	if opts.purgeCache {
-		// Resolve the key and the claims before deleting: in perService mode
-		// the claim is owner-ref'd to the InferenceService and is collected
-		// with it.
+		// Resolve the key, the Model's own claim and the claims before
+		// deleting: the Model has no finalizer, so nothing of it can be read
+		// after, and in perService mode the claim is owner-ref'd to the
+		// InferenceService and is collected with it.
 		purgeModel := &inferencev1alpha1.Model{}
 		if err := k8sClient.Get(ctx, client.ObjectKey{Name: opts.name, Namespace: opts.namespace}, purgeModel); err != nil {
 			fmt.Printf("Warning: failed to get Model for cache purge: %v\n", err)
 		} else if cacheKey = cachekey.EffectiveKey(purgeModel); cacheKey != "" {
+			modelClaim = modelCacheClaimName(purgeModel)
 			cacheTargets, cacheSvcs, cacheResolveErr = resolvePurgeTargets(ctx, k8sClient, opts.namespace)
 		}
 	}
@@ -144,7 +147,6 @@ func runDelete(opts *deleteOptions) error {
 			return fmt.Errorf("deployment deleted, but purging the cache failed: %w; "+
 				"run 'llmkube cache clear -n %s' to clear what remains", cacheResolveErr, opts.namespace)
 		}
-		modelClaim := modelOwnCacheClaim(ctx, k8sClient, opts.namespace, opts.name)
 		targets := targetedClaims(cacheTargets, cacheSvcs, opts.name, modelClaim)
 		var owned, purged []purgeTarget
 		for _, target := range targets {

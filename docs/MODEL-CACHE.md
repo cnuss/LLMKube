@@ -283,7 +283,8 @@ With the field set:
   (`<model>-prefetch-<claim hash>`) and `status.prefetch` entry.
 - The service creates no pods until that prefetch has succeeded for the
   Model's current spec, and reports `ModelPrefetched=False` with reason
-  `WaitingForPrefetch` (also in `status.schedulingStatus`) meanwhile. A
+  `WaitingForPrefetch` (also in `status.schedulingStatus`) meanwhile, or
+  `WaitingForModel` while the Model has not derived its cache key yet. A
   later change that needs new weights holds the same way: the live
   Deployment keeps serving the old template until the new prefetch
   completes, then rolls. A failed prefetch shows as `PrefetchFailed` and the
@@ -297,7 +298,9 @@ With the field set:
   condition) rather than downloading on the serving node. Add `spec.offline: true`
   when the runtime must not reach the Hub for anything the Job did not
   stage: the pods then get `HF_HUB_OFFLINE=1` and `TRANSFORMERS_OFFLINE=1`
-  and fail at once on such a lookup.
+  and fail at once on such a lookup. The field needs the operator to stage
+  the model; on a runtime that downloads the Model itself the service gets
+  an `OfflineRuntimeDownload` warning instead.
 - Use a `ReadWriteMany` (or `ReadOnlyMany`) claim when the serving pods run
   on other nodes than the Job. A `ReadWriteOnce` claim attaches to one node:
   the first staging works because the Job finishes before the pods attach,
@@ -314,14 +317,19 @@ With the field set:
   (or keeps its live Deployment as it is), and no Job runs. That covers
   model caching disabled on the operator, a runtime the operator does not
   stage (TGI, `generic` without `stageModel`, `skipModelInit: true`), a
-  `speculativeDecoding.draftModelRef` (the draft is not prefetched), and a
-  source the downloader does not stage ahead of time (`s3://`). The field
+  `speculativeDecoding.draftModelRef` (the draft is not prefetched), a
+  `multiNode` member with its own `modelCache.claimName` (that member's pod
+  mounts a claim the prefetch does not fill), and a source the downloader
+  does not stage ahead of time (`s3://`). The field
   is `PrefetchNotApplicable`, and not waited for, only where nothing
   downloads at serve time: Metal, `pvc://`, `oci://` and local sources.
 
 Applied together by GitOps, the pair above is safe in either order: the
 Model names the claim, the service inherits or repeats it, and the service
-waits for the staging it asked for.
+waits for the staging it asked for. The request itself is not inherited:
+`modelCache.prefetch` on the Model is `spec.prefetch`, which stages the
+Model's own claim and holds no service, so a service that must wait sets
+`modelCache.prefetch` in its own block.
 
 ### Placing the prefetch pod
 

@@ -855,8 +855,11 @@ type InferenceServiceSpec struct {
 	// operator did not stage (a tokenizer in another repository, remote
 	// code) fails at once instead of downloading on the serving node. Pair
 	// it with modelCache.prefetch or a pvc:// source in air-gapped
-	// clusters. llama.cpp reads a file path and ignores both. An explicit
-	// spec.env entry with the same name wins.
+	// clusters. It needs the operator to stage the model (or a pvc://
+	// source): a runtime that downloads the Model itself (skipModelInit,
+	// TGI, generic without stageModel) fails at start, and the service
+	// gets an OfflineRuntimeDownload warning. llama.cpp reads a file path
+	// and ignores both. An explicit spec.env entry with the same name wins.
 	// +optional
 	Offline bool `json:"offline,omitempty"`
 

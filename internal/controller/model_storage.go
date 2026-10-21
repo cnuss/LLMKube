@@ -850,16 +850,6 @@ func stagedFileNamesFromPlan(model *inferencev1alpha1.Model, plan *StagingPlan) 
 	return []string{singleFileStagedBasename(model)}
 }
 
-// prefetchStagedFileNames is stagedFileNamesFromPlan for a Model whose plan
-// is resolved here; an unresolvable plan yields the single-file name.
-func prefetchStagedFileNames(model *inferencev1alpha1.Model) []string {
-	plan, err := modelStagingPlan(model)
-	if err != nil {
-		plan = nil
-	}
-	return stagedFileNamesFromPlan(model, plan)
-}
-
 // modelStagingPlan resolves the model's declared files into a staging plan.
 // Returns nil when there is no multi-file staging. Returns an error when
 // multi-file fields are set but resolution fails (fail-closed).

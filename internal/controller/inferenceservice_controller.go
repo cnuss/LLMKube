@@ -831,7 +831,11 @@ func (r *InferenceServiceReconciler) reconcileDeployment(ctx context.Context, is
 	// A runtime that downloads the Model itself gets the mirror too, unless
 	// its token lives in another Secret; say so rather than silently going to
 	// huggingface.co.
-	if _, conflict := runtimeHFMirrorEnv(resolveBackend(isvc), isvc, model, hfEndpoint); conflict && r.Recorder != nil {
+	if offlineRuntimeDownload(isvc, model, resolveBackend(isvc)) && r.Recorder != nil {
+		r.Recorder.Eventf(isvc, nil, corev1.EventTypeWarning, ReasonOfflineRuntimeDownload, "Reconcile",
+			"%s", offlineRuntimeDownloadMessage(isvc, model))
+	}
+	if _, conflict := runtimeHFMirrorEnv(resolveBackend(isvc), isvc, model, hfEndpoint); !isvc.Spec.Offline && conflict && r.Recorder != nil {
 		r.Recorder.Eventf(isvc, nil, corev1.EventTypeWarning, ReasonHFMirrorNotApplied, "Reconcile",
 			"%s", hfMirrorNotAppliedMessage(model))
 	}

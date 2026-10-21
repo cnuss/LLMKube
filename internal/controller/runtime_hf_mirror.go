@@ -17,6 +17,8 @@ limitations under the License.
 package controller
 
 import (
+	"fmt"
+
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/utils/ptr"
 
@@ -28,6 +30,25 @@ import (
 // runtime cannot be pointed at without sending a token the Secret does not
 // bind to it.
 const ReasonHFMirrorNotApplied = "HFMirrorNotApplied"
+
+// ReasonOfflineRuntimeDownload is the Warning event reason for spec.offline on
+// a runtime that downloads its Model from the Hub itself: HF_HUB_OFFLINE=1
+// fails that download at start, and only the container log would say why.
+const ReasonOfflineRuntimeDownload = "OfflineRuntimeDownload"
+
+// offlineRuntimeDownload reports whether spec.offline cuts off a download the
+// runtime, not the operator, performs: a Hub repo id served by a runtime the
+// operator does not stage (skipModelInit, TGI, generic without stageModel).
+func offlineRuntimeDownload(isvc *inferencev1alpha1.InferenceService, model *inferencev1alpha1.Model, backend RuntimeBackend) bool {
+	return isvc != nil && isvc.Spec.Offline && model != nil &&
+		isHFRepoSource(model.Spec.Source) && !operatorStagesModel(isvc, backend)
+}
+
+func offlineRuntimeDownloadMessage(isvc *inferencev1alpha1.InferenceService, model *inferencev1alpha1.Model) string {
+	return fmt.Sprintf("spec.offline is set, but runtime %q downloads Model %q (%s) itself on the serving node, "+
+		"which HF_HUB_OFFLINE=1 refuses; let the operator stage the model (unset skipModelInit, or set stageModel) "+
+		"or use a pvc:// source", resolveServingRuntime(isvc), model.Name, model.Spec.Source)
+}
 
 // operatorStagesModel reports whether the operator stages the Model into the
 // serving pod. It stages when the runtime stages by default, or when

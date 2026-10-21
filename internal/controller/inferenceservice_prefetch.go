@@ -52,6 +52,9 @@ const (
 	// ReasonWaitingForPrefetch: the prefetch into this service's claim has not
 	// succeeded yet; the workload is held.
 	ReasonWaitingForPrefetch = "WaitingForPrefetch"
+	// ReasonWaitingForModel: the Model has not derived what the prefetch
+	// needs (its cache key) yet; the workload is held as Pending, not failed.
+	ReasonWaitingForModel = "WaitingForModel"
 	// ReasonPrefetchNotApplicable: the service asked, but there is no cache
 	// path to stage into (Metal, caching disabled, a pre-staged source); the
 	// workload proceeds as if the field were unset.
@@ -108,6 +111,10 @@ func (r *InferenceServiceReconciler) prefetchGate(isvc *inferencev1alpha1.Infere
 	case prefetchUnsupported:
 		g.applies, g.unsupported = true, true
 		g.reason, g.message = ReasonPrefetchUnsupported, why+"; the workload is held until the spec changes"
+		return g
+	case prefetchPending:
+		g.applies = true
+		g.reason, g.message = ReasonWaitingForModel, why
 		return g
 	}
 	g.applies = true
@@ -180,7 +187,8 @@ func (r *InferenceServiceReconciler) holdForPrefetch(ctx context.Context, isvc *
 		// The hold's diagnosis is this controller's to clear: the Ready path
 		// clears scheduling fields only once pods serve, and a first rollout
 		// that was held has none yet.
-		if isvc.Status.SchedulingStatus == ReasonWaitingForPrefetch || isvc.Status.SchedulingStatus == ReasonPrefetchFailed {
+		switch isvc.Status.SchedulingStatus {
+		case ReasonWaitingForPrefetch, ReasonWaitingForModel, ReasonPrefetchFailed:
 			isvc.Status.SchedulingStatus = ""
 			isvc.Status.SchedulingMessage = ""
 			isvc.Status.WaitingFor = ""

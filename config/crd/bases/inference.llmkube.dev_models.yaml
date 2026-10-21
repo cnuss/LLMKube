@@ -394,9 +394,11 @@ spec:
                   When claimName is set it is the prefetch target: the Job writes there
                   and never falls back to the shared cache, whatever services exist. It
                   is also the default for referencing InferenceServices: a service with
-                  no modelCache block of its own inherits this one, so the claim is
-                  declared once in a GitOps-applied pair; a service that sets its own
-                  block still wins. modelCache.prefetch is an alias of spec.prefetch.
+                  no modelCache block of its own inherits the claim, so it is declared
+                  once in a GitOps-applied pair; a service that sets its own block still
+                  wins. modelCache.prefetch is an alias of spec.prefetch and, like it,
+                  holds no service: a service that waits for the staging sets
+                  modelCache.prefetch itself.
 
                   Without it, the prefetch target is inferred from the referencing
                   services as before. persistence Ephemeral cannot be combined with

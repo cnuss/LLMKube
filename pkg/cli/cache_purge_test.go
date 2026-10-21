@@ -19,6 +19,7 @@ package cli
 import (
 	"context"
 	"fmt"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -546,6 +547,69 @@ func TestCachePVCandidates(t *testing.T) {
 	}
 	if strings.Join(all, ",") != strings.Join(want, ",") {
 		t.Errorf("candidates = %v, want the discovered caches plus the override", all)
+	}
+}
+
+// TestResolvePurgeTargets_InheritsOnlyTheReferencedModelsClaim drives the
+// real listing: a service that shares a model's name but references another
+// Model must not bring that other Model's claim into the purge, while a
+// service that references the model and has no block of its own does inherit
+// the model's claim.
+func TestResolvePurgeTargets_InheritsOnlyTheReferencedModelsClaim(t *testing.T) {
+	const ns = "default"
+	pvc := func(name string, labeled bool) *corev1.PersistentVolumeClaim {
+		p := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns}}
+		if labeled {
+			p.Labels = map[string]string{modelCacheLabel: modelCacheLabelValue}
+		}
+		return p
+	}
+	model := func(name, claim string) *inferencev1alpha1.Model {
+		m := &inferencev1alpha1.Model{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
+			Spec:       inferencev1alpha1.ModelSpec{Source: "hf://org/" + name},
+		}
+		if claim != "" {
+			m.Spec.ModelCache = &inferencev1alpha1.ModelCacheSpec{ClaimName: claim}
+		}
+		return m
+	}
+	svc := func(name, modelRef string) *inferencev1alpha1.InferenceService {
+		return &inferencev1alpha1.InferenceService{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
+			Spec:       inferencev1alpha1.InferenceServiceSpec{ModelRef: modelRef},
+		}
+	}
+	k8sClient := fake.NewClientBuilder().WithScheme(newCLIScheme()).WithObjects(
+		pvc(modelCachePVCName, true), pvc("other-claim", false), pvc("qwen-claim", false),
+		model("other", "other-claim"), model("qwen", "qwen-claim"),
+		svc("qwen", "other"), svc("svc-a", "qwen"),
+	).Build()
+	ctx := context.Background()
+
+	targets, svcs, err := resolvePurgeTargets(ctx, k8sClient, ns)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	names := func(targets []purgeTarget) []string {
+		out := make([]string, 0, len(targets))
+		for _, tgt := range targets {
+			out = append(out, tgt.Name)
+		}
+		return out
+	}
+	forQwen := names(targetedClaims(targets, svcs, "qwen", modelOwnCacheClaim(ctx, k8sClient, ns, "qwen")))
+	if slices.Contains(forQwen, "other-claim") {
+		t.Errorf("clearing qwen targets %v: other-claim belongs to Model other, "+
+			"which service qwen references but model qwen does not own", forQwen)
+	}
+	if !slices.Contains(forQwen, "qwen-claim") {
+		t.Errorf("clearing qwen targets %v, want qwen-claim: "+
+			"svc-a references qwen with no block and inherits its claim", forQwen)
+	}
+	forOther := names(targetedClaims(targets, svcs, "other", modelOwnCacheClaim(ctx, k8sClient, ns, "other")))
+	if !slices.Contains(forOther, "other-claim") || slices.Contains(forOther, "qwen-claim") {
+		t.Errorf("clearing other targets %v, want other-claim and not qwen-claim", forOther)
 	}
 }
 

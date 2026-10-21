@@ -22,6 +22,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/utils/ptr"
 
 	inferencev1alpha1 "github.com/defilantech/llmkube/api/v1alpha1"
 )
@@ -40,11 +41,36 @@ func TestOfflineEnv(t *testing.T) {
 			Spec:       inferencev1alpha1.InferenceServiceSpec{Runtime: RuntimeVLLM, ModelRef: "qwen", Offline: offline, Env: env},
 		}
 	}
+	mirrored := &inferencev1alpha1.Model{
+		ObjectMeta: metav1.ObjectMeta{Name: "qwen", Namespace: "default"},
+		Spec:       inferencev1alpha1.ModelSpec{Source: "Qwen/Qwen2.5-0.5B-Instruct", SourceSecretRef: &corev1.LocalObjectReference{Name: "hf-mirror"}},
+	}
+	selfFetching := func(offline bool) *inferencev1alpha1.InferenceService {
+		s := isvc(offline)
+		s.Spec.SkipModelInit = ptr.To(true)
+		return s
+	}
 	cases := []struct {
-		name string
-		isvc *inferencev1alpha1.InferenceService
-		want map[string][]string
+		name       string
+		isvc       *inferencev1alpha1.InferenceService
+		model      *inferencev1alpha1.Model
+		hfEndpoint string
+		want       map[string][]string
 	}{
+		{
+			name:       "a self-fetching runtime gets the mirror when it may reach the Hub",
+			isvc:       selfFetching(false),
+			model:      mirrored,
+			hfEndpoint: testMirror,
+			want:       map[string][]string{"HF_ENDPOINT": {testMirror}, "HF_HUB_OFFLINE": nil},
+		},
+		{
+			name:       "offline drops the mirror a self-fetching runtime would get",
+			isvc:       selfFetching(true),
+			model:      mirrored,
+			hfEndpoint: testMirror,
+			want:       map[string][]string{"HF_ENDPOINT": nil, "HF_HUB_OFFLINE": {"1"}},
+		},
 		{
 			name: "unset leaves the runtime free to reach the Hub",
 			isvc: isvc(false),
@@ -64,7 +90,11 @@ func TestOfflineEnv(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			r := &InferenceServiceReconciler{ModelCachePath: "/models", ModelCacheMode: ModelCacheModePerService}
-			dep := r.constructDeployment(tc.isvc, model, nil, 1, "", "")
+			m := tc.model
+			if m == nil {
+				m = model
+			}
+			dep := r.constructDeployment(tc.isvc, m, nil, 1, tc.hfEndpoint, "")
 			for name, want := range tc.want {
 				var got []string
 				for _, e := range mirrorEnv(dep, name) {

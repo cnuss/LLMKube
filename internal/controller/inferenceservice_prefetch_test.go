@@ -440,18 +440,20 @@ var _ = Describe("InferenceService modelCache.prefetch (#2136)", func() {
 		Expect(cond.Reason).To(Equal(ReasonPrefetchFailed))
 	})
 
-	It("inherits the Model's modelCache on a service without its own, in memory only", func() {
+	It("inherits the Model's claim on a service without its own, in memory only, and not the Model's prefetch request", func() {
 		createCachePVC(ctx, ns, "model-cache")
 		model := readyModel("inherit-model", "https://example.com/models/llama.gguf", func(m *inferencev1alpha1.Model) {
-			m.Spec.ModelCache = &inferencev1alpha1.ModelCacheSpec{ClaimName: "model-cache"}
+			m.Spec.ModelCache = &inferencev1alpha1.ModelCacheSpec{ClaimName: "model-cache", Prefetch: true}
 		})
 		isvc := newService("inherit", model.Name, nil)
 
-		reconcileService(isvcReconciler(), isvc.Name)
+		got := reconcileService(isvcReconciler(), isvc.Name)
 		dep := &appsv1.Deployment{}
-		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: isvc.Name, Namespace: ns}, dep)).To(Succeed())
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: isvc.Name, Namespace: ns}, dep)).To(Succeed(),
+			"the Model's modelCache.prefetch is spec.prefetch, which holds no service")
 		Expect(cacheClaimOf(&dep.Spec.Template.Spec)).To(Equal("model-cache"), "the claim is declared once, on the Model")
-		Expect(initContainerNames(&dep.Spec.Template.Spec)).To(ContainElement("model-downloader"), "no prefetch was asked for, so the pod downloads as before")
+		Expect(initContainerNames(&dep.Spec.Template.Spec)).To(ContainElement("model-downloader"), "the service did not ask for prefetch, so the pod downloads as before")
+		Expect(meta.FindStatusCondition(got.Status.Conditions, ConditionModelPrefetched)).To(BeNil())
 
 		stored := &inferencev1alpha1.InferenceService{}
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: isvc.Name, Namespace: ns}, stored)).To(Succeed())
@@ -468,6 +470,39 @@ var _ = Describe("InferenceService modelCache.prefetch (#2136)", func() {
 		Expect(cond).NotTo(BeNil())
 		Expect(cond.Status).To(Equal(metav1.ConditionFalse))
 		Expect(cond.Reason).To(Equal(ReasonPrefetchNotApplicable))
+	})
+
+	It("holds a service as Pending, not Failed, while its Model has no cache key yet", func() {
+		createCachePVC(ctx, ns, "nokey-cache")
+		model := readyModel("nokey-model", "https://example.com/models/llama.gguf", nil)
+		model.Status.CacheKey = ""
+		Expect(k8sClient.Status().Update(ctx, model)).To(Succeed())
+		isvc := newService("nokey", model.Name, &inferencev1alpha1.ModelCacheSpec{ClaimName: "nokey-cache", Prefetch: true})
+
+		got := reconcileService(isvcReconciler(), isvc.Name)
+		Expect(apierrors.IsNotFound(k8sClient.Get(ctx, types.NamespacedName{Name: isvc.Name, Namespace: ns}, &appsv1.Deployment{}))).To(BeTrue())
+		Expect(got.Status.Phase).To(Equal("Pending"), "the key arrives with the Model's next reconcile; nothing is terminal")
+		Expect(got.Status.SchedulingStatus).To(Equal(ReasonWaitingForModel))
+		cond := meta.FindStatusCondition(got.Status.Conditions, ConditionModelPrefetched)
+		Expect(cond).NotTo(BeNil())
+		Expect(cond.Status).To(Equal(metav1.ConditionFalse))
+		Expect(cond.Reason).To(Equal(ReasonWaitingForModel))
+	})
+
+	It("warns when spec.offline cuts off a runtime that downloads its own Model", func() {
+		model := readyModel("offline-tgi-model", "example-org/offline-repo", nil)
+		isvc := newService("offline-tgi", model.Name, nil)
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: isvc.Name, Namespace: ns}, isvc)).To(Succeed())
+		isvc.Spec.Runtime = "tgi"
+		isvc.Spec.Offline = true
+		Expect(k8sClient.Update(ctx, isvc)).To(Succeed())
+
+		r := isvcReconciler()
+		recorder := events.NewFakeRecorder(50)
+		r.Recorder = recorder
+		reconcileService(r, isvc.Name)
+		Expect(drainEvents(recorder)).To(ContainElement(HavePrefix("Warning "+ReasonOfflineRuntimeDownload)),
+			"TGI fetches the repo itself, which HF_HUB_OFFLINE=1 refuses; the pod would crash-loop with only its log saying why")
 	})
 
 	It("rejects modelCache.prefetch with persistence Ephemeral at admission", func() {
@@ -639,15 +674,26 @@ var _ = Describe("prefetchGate classification", func() {
 		Entry("a stageable source on a staging runtime", "/models", https, nil, true, false, ReasonWaitingForPrefetch),
 	)
 
-	It("resolves the Model's modelCache for a service without its own, without mutating the service", func() {
+	It("inherits the Model's claim for a service without its own, not the Model's prefetch request", func() {
 		model := newModel(https)
 		model.Spec.ModelCache = &inferencev1alpha1.ModelCacheSpec{ClaimName: "model-cache", Prefetch: true}
 		svc := newService(func(s *inferencev1alpha1.InferenceService) { s.Spec.ModelCache = nil })
 		g := reconciler("/models").prefetchGate(svc, model)
-		Expect(g.requested).To(BeTrue())
-		Expect(g.applies).To(BeTrue())
-		Expect(g.claim).To(Equal("model-cache"))
+		Expect(g.requested).To(BeFalse(), "modelCache.prefetch on the Model is spec.prefetch; a service asks with its own block")
 		Expect(svc.Spec.ModelCache).To(BeNil(), "the gate reads an effective copy")
+		Expect(effectiveCacheService(svc, model).Spec.ModelCache.ClaimName).To(Equal("model-cache"))
+	})
+
+	It("refuses a multiNode member that mounts its own claim, which no prefetch stages", func() {
+		svc := newService(func(s *inferencev1alpha1.InferenceService) {
+			s.Spec.MultiNode = &inferencev1alpha1.MultiNodeSpec{Members: []inferencev1alpha1.MultiNodeMember{
+				{Node: "node-a"},
+				{Node: "node-b", ModelCache: &inferencev1alpha1.MultiNodeMemberCache{ClaimName: "node-b-cache"}},
+			}}
+		})
+		g := reconciler("/models").prefetchGate(svc, newModel(https))
+		Expect(g.unsupported).To(BeTrue(), "rank 1 would mount node-b-cache read-only and fail model-verify forever")
+		Expect(g.message).To(ContainSubstring("node-b-cache"))
 	})
 })
 

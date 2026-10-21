@@ -57,11 +57,15 @@ const (
 	// prefetchUnsupported: the pods would download at serve time and no
 	// prefetch can cover it. The request is refused, not ignored.
 	prefetchUnsupported
+	// prefetchPending: the request can be honoured once the Model's own
+	// reconcile has caught up (its cache key is not derived yet).
+	prefetchPending
 )
 
 // classifyPrefetchRequest is the one place that decides whether a prefetch
 // request can be honoured. isvc must already carry its effective modelCache.
 func classifyPrefetchRequest(isvc *inferencev1alpha1.InferenceService, model *inferencev1alpha1.Model, modelCachePath string) (prefetchApplicability, string) {
+	memberNode, memberClaim := multiNodeMemberClaim(isvc)
 	switch {
 	case isMetalModel(model):
 		return prefetchNotApplicable, "a Metal service mounts no cache claim; the host metal-agent fetches the model itself"
@@ -75,12 +79,30 @@ func classifyPrefetchRequest(isvc *inferencev1alpha1.InferenceService, model *in
 		return prefetchUnsupported, fmt.Sprintf("runtime %q fetches the model itself on the serving node (skipModelInit, or a runtime that stages only with spec.stageModel); a prefetched claim cannot be put in front of it", resolveServingRuntime(isvc))
 	case draftModelRefFor(isvc) != "":
 		return prefetchUnsupported, fmt.Sprintf("speculativeDecoding.draftModelRef %q is not prefetched and its downloader would run on the serving node", draftModelRefFor(isvc))
+	case memberClaim != "":
+		return prefetchUnsupported, fmt.Sprintf("multiNode member on node %q mounts its own cache claim %q, which no prefetch stages; the prefetch covers the service-level claim only", memberNode, memberClaim)
 	case !prefetchableSource(model):
 		return prefetchUnsupported, fmt.Sprintf("source %q is not one the downloader stages ahead of time, so the pods would download it on the serving node", model.Spec.Source)
 	case effectiveModelCacheKey(model) == "":
-		return prefetchUnsupported, fmt.Sprintf("Model %q has no cache key yet; it is derived when the Model reconciles", model.Name)
+		return prefetchPending, fmt.Sprintf("Model %q has no cache key yet; it is derived when the Model reconciles", model.Name)
 	}
 	return prefetchApplies, ""
+}
+
+// multiNodeMemberClaim returns the first member-level claim override and its
+// node, or "". memberPodFromTemplate rewrites that member's cache volume to
+// it, so a prefetch into the service-level claim never fills what the pod
+// mounts.
+func multiNodeMemberClaim(isvc *inferencev1alpha1.InferenceService) (node, claim string) {
+	if isvc == nil || isvc.Spec.MultiNode == nil {
+		return "", ""
+	}
+	for _, m := range isvc.Spec.MultiNode.Members {
+		if m.ModelCache != nil && m.ModelCache.ClaimName != "" {
+			return m.Node, m.ModelCache.ClaimName
+		}
+	}
+	return "", ""
 }
 
 // resolveServingRuntime names the runtime for messages.
@@ -91,11 +113,21 @@ func resolveServingRuntime(isvc *inferencev1alpha1.InferenceService) string {
 	return isvc.Spec.Runtime
 }
 
+// inheritedModelCache is the block a service with no modelCache of its own
+// takes from the Model: the claim and its settings, never the prefetch
+// request. Model.spec.modelCache.prefetch is spec.prefetch, which holds no
+// service; a service that waits for the staging asks with its own block.
+func inheritedModelCache(model *inferencev1alpha1.Model) *inferencev1alpha1.ModelCacheSpec {
+	cache := model.Spec.ModelCache.DeepCopy()
+	cache.Prefetch = false
+	return cache
+}
+
 // inheritModelCache gives a service with no modelCache block of its own the
-// Model's, in memory only: the claim is declared once on the Model and every
-// referencing service resolves it, while a service that sets its own block
-// keeps it. The controller never writes an InferenceService spec, so the copy
-// is never persisted.
+// Model's claim, in memory only: the claim is declared once on the Model and
+// every referencing service resolves it, while a service that sets its own
+// block keeps it. The controller never writes an InferenceService spec, so
+// the copy is never persisted.
 //
 // A status write mid-reconcile decodes the server's object back into isvc and
 // drops the block again, so the helpers that read it after such a write go
@@ -105,7 +137,7 @@ func inheritModelCache(isvc *inferencev1alpha1.InferenceService, model *inferenc
 	if isvc == nil || model == nil || isvc.Spec.ModelCache != nil || model.Spec.ModelCache == nil {
 		return
 	}
-	isvc.Spec.ModelCache = model.Spec.ModelCache.DeepCopy()
+	isvc.Spec.ModelCache = inheritedModelCache(model)
 }
 
 // effectiveCacheService returns isvc as the cache helpers should read it: the
@@ -116,7 +148,7 @@ func effectiveCacheService(isvc *inferencev1alpha1.InferenceService, model *infe
 		return isvc
 	}
 	eff := *isvc
-	eff.Spec.ModelCache = model.Spec.ModelCache.DeepCopy()
+	eff.Spec.ModelCache = inheritedModelCache(model)
 	return &eff
 }
 
@@ -160,9 +192,8 @@ func prefetchableSource(model *inferencev1alpha1.Model) bool {
 }
 
 // servicePrefetchRequested reports whether an InferenceService asks for its
-// Model to be prefetched into its own cache claim. Read after
-// inheritModelCache, so a service that inherits the Model's block inherits
-// the request too.
+// Model to be prefetched into the cache claim its pods mount. The request is
+// the service's own: inheritModelCache carries the Model's claim, not this.
 func servicePrefetchRequested(isvc *inferencev1alpha1.InferenceService) bool {
 	return isvc != nil && isvc.Spec.ModelCache != nil && isvc.Spec.ModelCache.Prefetch &&
 		isvc.Spec.ModelCache.Persistence != inferencev1alpha1.ModelCachePersistenceEphemeral

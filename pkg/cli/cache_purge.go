@@ -572,10 +572,11 @@ func cachePVCandidates(
 }
 
 // modelServices returns every InferenceService in namespace, which carries the
-// claims a purge may target beyond the label-discovered ones, and every Model.
-// A service with no modelCache block of its own resolves its Model's, as the
-// controller does (Model.spec.modelCache is the default for the services that
-// reference it); the copy is in memory only.
+// claims a purge may target beyond the label-discovered ones, and every Model,
+// both as stored. A Model's modelCache is inherited in one place,
+// targetedClaims, by the services that reference the model being cleared, so
+// a service that merely shares a model's name never resolves to another
+// Model's claim.
 func modelServices(
 	ctx context.Context, k8sClient client.Client, namespace string,
 ) ([]inferencev1alpha1.InferenceService, []inferencev1alpha1.Model, error) {
@@ -586,19 +587,6 @@ func modelServices(
 	models := &inferencev1alpha1.ModelList{}
 	if err := k8sClient.List(ctx, models, client.InNamespace(namespace)); err != nil {
 		return nil, nil, fmt.Errorf("failed to list Models: %w", err)
-	}
-	byName := make(map[string]*inferencev1alpha1.Model, len(models.Items))
-	for i := range models.Items {
-		byName[models.Items[i].Name] = &models.Items[i]
-	}
-	for i := range list.Items {
-		svc := &list.Items[i]
-		if svc.Spec.ModelCache != nil {
-			continue
-		}
-		if m, ok := byName[svc.Spec.ModelRef]; ok && m.Spec.ModelCache != nil {
-			svc.Spec.ModelCache = m.Spec.ModelCache.DeepCopy()
-		}
 	}
 	return list.Items, models.Items, nil
 }
