@@ -332,6 +332,19 @@ spec:
 All three govern only where the download runs, never where the model is
 served.
 
+Placement has to reach the claim. A claim on one node's local disk (a
+`WaitForFirstConsumer` local-path volume that is already bound, a hostPath
+PV) can only be filled from that node, so a rule that keeps the Job off the
+GPU nodes leaves it unschedulable when the claim lives on one. The Job pod
+requests no GPU, so pinning it to the claim's node with
+`prefetchNodeSelector` still keeps the download out of the serving pods; an
+off-GPU rule is for a claim every node can reach (an RWX class, a blob
+mount). A Job whose pod cannot be scheduled never completes and never fails:
+the Model stays `Downloading`, its `status.prefetch` entry and `Progressing`
+condition carry the scheduler's message (reason `PrefetchUnschedulable`, for
+example `volume node affinity conflict`), and a `PrefetchUnschedulable`
+warning event is recorded. Fix the placement, then delete the Job to retry.
+
 Limitations:
 
 - Prefetch applies to remote sources (`https://`, `hf://`, and a bare
@@ -347,6 +360,9 @@ Limitations:
   for it; check the Job's pod logs (the name is in `status.prefetch`). The
   Job self-cleans 24 hours after finishing and is garbage-collected with
   the Model.
+- There is no timeout on a prefetch Job. A pod that cannot be scheduled is
+  reported as above; a pod that is scheduled but stalls (a slow or hung
+  source) is visible only in its logs.
 
 See `config/samples/model_prefetch.yaml` and
 `config/samples/model_prefetch_gitops.yaml` for complete examples.

@@ -352,6 +352,63 @@ var _ = Describe("Model Prefetch", func() {
 			Expect(progressing.Reason).To(Equal(ReasonPrefetchFailed))
 		})
 
+		// A placement that keeps the download off the GPU nodes cannot reach a
+		// claim that lives on one of them. The Job then never completes and
+		// never fails, so the status must say why instead of "downloading".
+		It("names the scheduler's reason while the Job's pod cannot be scheduled", func() {
+			model := newPrefetchModel("model-prefetch-unschedulable")
+			Expect(k8sClient.Create(ctx, model)).To(Succeed())
+			defer func() { _ = k8sClient.Delete(ctx, model) }()
+			modelKey := types.NamespacedName{Name: model.Name, Namespace: ns}
+			jobName := prefetchJobName(model)
+			r := prefetchReconciler()
+			recorder := events.NewFakeRecorder(20)
+			r.Recorder = recorder
+
+			_, _, err := r.reconcilePrefetch(ctx, model)
+			Expect(err).NotTo(HaveOccurred())
+
+			// envtest runs no Job controller or scheduler: stand in for both.
+			const schedulerMsg = "0/2 nodes are available: 1 node(s) had volume node affinity conflict, 1 node(s) didn't match Pod's node affinity/selector."
+			pod := &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{Name: jobName + "-abcde", Namespace: ns, Labels: map[string]string{"batch.kubernetes.io/job-name": jobName}},
+				Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: "x", Image: "busybox"}}},
+			}
+			Expect(k8sClient.Create(ctx, pod)).To(Succeed())
+			defer func() { _ = k8sClient.Delete(ctx, pod) }()
+			pod.Status.Phase = corev1.PodPending
+			pod.Status.Conditions = []corev1.PodCondition{{Type: corev1.PodScheduled, Status: corev1.ConditionFalse, Reason: corev1.PodReasonUnschedulable, Message: schedulerMsg}}
+			Expect(k8sClient.Status().Update(ctx, pod)).To(Succeed())
+
+			Expect(k8sClient.Get(ctx, modelKey, model)).To(Succeed())
+			_, _, err = r.reconcilePrefetch(ctx, model)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(k8sClient.Get(ctx, modelKey, model)).To(Succeed())
+			Expect(model.Status.Phase).To(Equal(PhaseDownloading))
+			Expect(model.Status.Prefetch[0].Phase).To(Equal(inferencev1alpha1.PrefetchPhaseRunning))
+			Expect(model.Status.Prefetch[0].Message).To(ContainSubstring("cannot be scheduled"))
+			Expect(model.Status.Prefetch[0].Message).To(ContainSubstring("volume node affinity conflict"))
+			Expect(model.Status.Prefetch[0].Message).To(ContainSubstring("delete the Job to retry"))
+			progressing := meta.FindStatusCondition(model.Status.Conditions, ConditionProgressing)
+			Expect(progressing).NotTo(BeNil())
+			Expect(progressing.Reason).To(Equal(ReasonPrefetchUnschedulable))
+			Expect(progressing.Message).To(ContainSubstring("volume node affinity conflict"))
+			Expect(drainEvents(recorder)).To(ContainElement(HavePrefix("Warning " + ReasonPrefetchUnschedulable)))
+
+			By("clearing once the pod schedules")
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: pod.Name, Namespace: ns}, pod)).To(Succeed())
+			pod.Status.Phase = corev1.PodRunning
+			pod.Status.Conditions = []corev1.PodCondition{{Type: corev1.PodScheduled, Status: corev1.ConditionTrue}}
+			Expect(k8sClient.Status().Update(ctx, pod)).To(Succeed())
+			Expect(k8sClient.Get(ctx, modelKey, model)).To(Succeed())
+			_, _, err = r.reconcilePrefetch(ctx, model)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(k8sClient.Get(ctx, modelKey, model)).To(Succeed())
+			Expect(model.Status.Prefetch[0].Message).NotTo(ContainSubstring("cannot be scheduled"))
+			progressing = meta.FindStatusCondition(model.Status.Conditions, ConditionProgressing)
+			Expect(progressing.Reason).To(Equal(ReasonPrefetchRunning))
+		})
+
 		// The Job name is deterministic, so a user's Job can sit at it. It is
 		// neither adopted as the prefetch nor deleted to make room.
 		It("neither adopts nor deletes a Job at the prefetch name that the Model does not own", func() {

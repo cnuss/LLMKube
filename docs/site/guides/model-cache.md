@@ -145,7 +145,11 @@ spec:
 
 Name the claim on the Model with `spec.modelCache.claimName` rather than
 relying on the services to agree: it is the prefetch target whatever services
-exist, and a service with no `modelCache` block of its own inherits it. A
+exist, and a service with no `modelCache` block of its own inherits it. Keep
+the Job's placement able to reach that claim: a node-local claim is filled
+only from its node, so pin the Job there rather than away from the GPU
+nodes; a Job that cannot be scheduled is reported on the Model as
+`PrefetchUnschedulable` and never finishes on its own. A
 service can also require that its weights were staged before it starts, with
 `spec.modelCache.prefetch: true`; it then creates no pods until the prefetch
 into its claim succeeds, and its pods mount the claim read-only with no

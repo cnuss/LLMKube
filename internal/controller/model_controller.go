@@ -202,6 +202,7 @@ func (r *ModelReconciler) metadataClient() *http.Client {
 // +kubebuilder:rbac:groups=inference.llmkube.dev,resources=inferenceservices,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=persistentvolumeclaims,verbs=get;list;watch;create
 // +kubebuilder:rbac:groups=batch,resources=jobs,verbs=get;list;watch;create;delete
+// +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=nodes,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=secrets,verbs=get
 // +kubebuilder:rbac:groups="",resources=configmaps,verbs=get;list;watch

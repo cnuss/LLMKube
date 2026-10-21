@@ -97,6 +97,9 @@ const (
 	ReasonPrefetchFailed        = "PrefetchFailed"
 	ReasonPrefetchComplete      = "PrefetchComplete"
 	ReasonModelPrefetched       = "ModelPrefetched"
+	// ReasonPrefetchUnschedulable: the Job's pod cannot be scheduled, so the
+	// download has not started. Placement (or the claim's node) is the fix.
+	ReasonPrefetchUnschedulable = "PrefetchUnschedulable"
 )
 
 const (
@@ -573,8 +576,29 @@ func (r *ModelReconciler) gateModelOnOwnPrefetch(ctx context.Context, model *inf
 			}
 			setCondition(model, ConditionProgressing, metav1.ConditionTrue, outcome.reason, message)
 		}
+		// A Job that cannot be scheduled is still Downloading, but the
+		// condition carries the scheduler's reason while it lasts, and the
+		// running message once it clears. The transition time moves only
+		// when the status does.
+		if outcome.reason == ReasonPrefetchUnschedulable || progressingReason(model) == ReasonPrefetchUnschedulable {
+			meta.SetStatusCondition(&model.Status.Conditions, metav1.Condition{
+				Type:               ConditionProgressing,
+				Status:             metav1.ConditionTrue,
+				ObservedGeneration: model.Generation,
+				Reason:             outcome.reason,
+				Message:            entry.Message,
+			})
+		}
 		return true, ctrl.Result{RequeueAfter: requeue}, nil
 	}
+}
+
+// progressingReason returns the Progressing condition's reason, or "".
+func progressingReason(model *inferencev1alpha1.Model) string {
+	if c := meta.FindStatusCondition(model.Status.Conditions, ConditionProgressing); c != nil {
+		return c.Reason
+	}
+	return ""
 }
 
 // reconcilePrefetchTarget brings one target's Job and status entry in line
@@ -667,10 +691,46 @@ func (r *ModelReconciler) reconcilePrefetchTarget(ctx context.Context, model, jo
 		// Still running: reflect progress and poll. The Job's completion
 		// does not generate a Model event, so a modest requeue keeps the
 		// status honest without watching Jobs from this controller.
-		setPrefetchPhase(entry, inferencev1alpha1.PrefetchPhaseRunning,
-			fmt.Sprintf("prefetch job %q downloading into %q", job.Name, t.claim))
-		return prefetchTargetOutcome{requeue: prefetchPollInterval, reason: ReasonPrefetchRunning}, nil
+		reason := ReasonPrefetchRunning
+		message := fmt.Sprintf("prefetch job %q downloading into %q", job.Name, t.claim)
+		// A Job whose pod cannot be scheduled never completes and never
+		// fails: a placement that keeps the download off the GPU nodes
+		// cannot reach a claim that lives on one of them. Say so rather than
+		// report a download that has not started.
+		if blocked := r.prefetchJobUnschedulable(ctx, job); blocked != "" {
+			reason = ReasonPrefetchUnschedulable
+			message = fmt.Sprintf("prefetch job %q cannot be scheduled: %s. Fix the Model's prefetch placement "+
+				"(prefetchNodeSelector, prefetchTolerations, prefetchAffinity) so the pod can reach claim %q, then delete the Job to retry",
+				job.Name, blocked, t.claim)
+			if entry.Message != message && r.Recorder != nil {
+				r.Recorder.Eventf(model, nil, corev1.EventTypeWarning, ReasonPrefetchUnschedulable, "Prefetch", "%s", message)
+			}
+		}
+		setPrefetchPhase(entry, inferencev1alpha1.PrefetchPhaseRunning, message)
+		return prefetchTargetOutcome{requeue: prefetchPollInterval, reason: reason}, nil
 	}
+}
+
+// prefetchJobUnschedulable returns the scheduler's message for a Job pod that
+// is Pending and Unschedulable, or "". The pods are read through the cache
+// the InferenceService controller's Pod watch already fills.
+func (r *ModelReconciler) prefetchJobUnschedulable(ctx context.Context, job *batchv1.Job) string {
+	pods := &corev1.PodList{}
+	if err := r.List(ctx, pods, client.InNamespace(job.Namespace), client.MatchingLabels{"batch.kubernetes.io/job-name": job.Name}); err != nil {
+		return ""
+	}
+	for i := range pods.Items {
+		pod := &pods.Items[i]
+		if pod.Status.Phase != corev1.PodPending {
+			continue
+		}
+		for _, c := range pod.Status.Conditions {
+			if c.Type == corev1.PodScheduled && c.Status == corev1.ConditionFalse && c.Reason == corev1.PodReasonUnschedulable {
+				return c.Message
+			}
+		}
+	}
+	return ""
 }
 
 // startPrefetchTarget makes sure the target claim exists (the shared cache is

@@ -10,9 +10,13 @@
 # Notes:
 # - A glob in spec.files is expanded from the repository listing before the
 #   Job is built, as it is for the serving pods.
-# - prefetchAffinity keeps the download off the GPU nodes; the claim must be
-#   reachable from both the download node and the serving node (an RWX class,
-#   or a claim pinned to a node that does both).
+# - prefetchAffinity keeps the download off the GPU nodes. That needs a claim
+#   every node can reach (an RWX class, a blob mount). A claim on one GPU
+#   node's local disk can only be filled from that node: drop the affinity
+#   and pin the Job there with prefetchNodeSelector instead (the Job pod
+#   requests no GPU, so the download still stays out of the serving pods).
+#   A Job that cannot be scheduled never finishes; the Model's
+#   status.prefetch entry says why, and deleting the Job retries it.
 # - Progress is in the Model's status.prefetch (one entry per claim) and in
 #   the service's ModelPrefetched condition.
 apiVersion: inference.llmkube.dev/v1alpha1
