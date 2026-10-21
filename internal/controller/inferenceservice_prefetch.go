@@ -19,11 +19,9 @@ package controller
 import (
 	"context"
 	"fmt"
-	"path/filepath"
 	"strings"
 
 	appsv1 "k8s.io/api/apps/v1"
-	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -324,10 +322,10 @@ func (r *InferenceServiceReconciler) restagePrefetchOnMissingFiles(ctx context.C
 	if !g.applies || !g.satisfied {
 		return
 	}
-	cond := meta.FindStatusCondition(isvc.Status.Conditions, ConditionModelTransferHealthy)
-	if cond == nil || cond.Status != metav1.ConditionFalse || cond.Reason != ReasonPrefetchedFilesMissing {
+	if !serviceReportsPrefetchedFilesMissing(isvc) {
 		return
 	}
+	cond := meta.FindStatusCondition(isvc.Status.Conditions, ConditionModelTransferHealthy)
 	entry := findPrefetchStatus(model, g.claim)
 	if entry == nil || entry.JobName == "" {
 		return
@@ -336,15 +334,14 @@ func (r *InferenceServiceReconciler) restagePrefetchOnMissingFiles(ctx context.C
 		return
 	}
 	log := logf.FromContext(ctx)
-	job := &batchv1.Job{}
-	if err := r.Get(ctx, types.NamespacedName{Name: entry.JobName, Namespace: model.Namespace}, job); err != nil {
-		// Gone already: the Model controller re-verifies on its own.
-		if !apierrors.IsNotFound(err) {
-			log.Error(err, "Failed to read the prefetch job to re-stage", "job", entry.JobName)
-		}
+	// Gone already, or not this Model's: the Model controller re-verifies
+	// a missing Job on its own, and a foreign Job is nobody's to delete.
+	job, err := ownedPrefetchJob(ctx, r.Client, model, entry.JobName)
+	if err != nil {
+		log.Error(err, "Failed to read the prefetch job to re-stage", "job", entry.JobName)
 		return
 	}
-	if !metav1.IsControlledBy(job, model) {
+	if job == nil {
 		return
 	}
 	// A staging already in flight is the remedy, not a stale Job; and one
@@ -356,7 +353,7 @@ func (r *InferenceServiceReconciler) restagePrefetchOnMissingFiles(ctx context.C
 	if job.Status.CompletionTime != nil && !cond.LastTransitionTime.After(job.Status.CompletionTime.Time) {
 		return
 	}
-	if err := r.Delete(ctx, job, client.PropagationPolicy(metav1.DeletePropagationBackground)); err != nil && !apierrors.IsNotFound(err) {
+	if err := deletePrefetchJob(ctx, r.Client, job); err != nil {
 		log.Error(err, "Failed to delete the prefetch job to re-stage", "job", job.Name)
 		return
 	}
@@ -373,12 +370,13 @@ func (r *InferenceServiceReconciler) restagePrefetchOnMissingFiles(ctx context.C
 // one this service mounts: its pods download at serve time, which is what
 // the Model's spec.prefetch was meant to avoid.
 func (r *InferenceServiceReconciler) warnPrefetchTargetMismatch(isvc *inferencev1alpha1.InferenceService, model *inferencev1alpha1.Model) {
-	isvc = effectiveCacheService(isvc, model)
-	if r.Recorder == nil || servicePrefetchRequested(isvc) || !modelWantsPrefetch(model) || isMetalModel(model) ||
-		!modelNeedsCachePVC(model, isvc, r.ModelCachePath) {
+	if r.Recorder == nil {
 		return
 	}
-	claim := modelCachePVCName(isvc, r.ModelCacheMode)
+	claim, ok := unprefetchedConsumerClaim(effectiveCacheService(isvc, model), model, r.ModelCacheMode, r.ModelCachePath)
+	if !ok {
+		return
+	}
 	var staged []string
 	for _, e := range model.Status.Prefetch {
 		if e.ClaimName == claim {
@@ -437,22 +435,13 @@ func buildPrefetchedStorageConfig(model *inferencev1alpha1.Model, isvc *inferenc
 		stagedDir string
 		files     []string
 	)
-	switch {
-	case len(staged) > 0:
-		files = staged
-		modelPath = stagedCachePath(cacheDir, staged[0])
-		if plan != nil {
-			stagedDir = cacheDir
-		}
-	case plan != nil:
-		modelPath = stagedCachePath(cacheDir, plan.Primary)
+	files = staged
+	if len(files) == 0 {
+		files = stagedFileNamesFromPlan(model, plan)
+	}
+	modelPath = stagedCachePath(cacheDir, files[0])
+	if plan != nil {
 		stagedDir = cacheDir
-		files = plan.Files
-	default:
-		// The basename the Job's downloader wrote: see buildCachedStorageConfig.
-		basename := singleFileStagedBasename(model)
-		modelPath = fmt.Sprintf("%s/%s", cacheDir, basename)
-		files = []string{basename}
 	}
 
 	env := []corev1.EnvVar{
@@ -484,25 +473,6 @@ func buildPrefetchedStorageConfig(model *inferencev1alpha1.Model, isvc *inferenc
 		volumes:      volumes,
 		volumeMounts: mounts,
 	}
-}
-
-// singleFileStagedBasename is the name the download path writes a
-// single-file Model under: see buildCachedStorageConfig.
-func singleFileStagedBasename(model *inferencev1alpha1.Model) string {
-	if model.Status.Path != "" {
-		return filepath.Base(model.Status.Path)
-	}
-	return canonicalModelBasename(model)
-}
-
-// prefetchStagedFileNames lists what a prefetch Job built from jobModel
-// writes under the cache key, primary first: the staging plan's files, or
-// the single-file basename.
-func prefetchStagedFileNames(jobModel *inferencev1alpha1.Model) []string {
-	if plan, err := modelStagingPlan(jobModel); err == nil && plan != nil {
-		return append([]string(nil), plan.Files...)
-	}
-	return []string{singleFileStagedBasename(jobModel)}
 }
 
 // buildPrefetchVerifyCommand checks every staged file is present on the

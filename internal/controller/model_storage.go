@@ -826,6 +826,40 @@ func effectiveModelCacheKey(model *inferencev1alpha1.Model) string {
 	return cachekey.EffectiveKey(model)
 }
 
+// singleFileStagedBasename is the name a single-file Model is staged under
+// in its cache directory. It matches the basename the Model controller
+// renames the file to after parsing GGUF metadata: Status.Path when the
+// controller populated it, so a cache hit lands on the same file, else the
+// canonical basename, so an init container creates the file at the path the
+// controller would.
+func singleFileStagedBasename(model *inferencev1alpha1.Model) string {
+	if model.Status.Path != "" {
+		return filepath.Base(model.Status.Path)
+	}
+	return canonicalModelBasename(model)
+}
+
+// stagedFileNamesFromPlan lists the cache-relative names a Model's files are
+// staged under, primary first: the plan's files for a multi-file Model, or
+// the single-file basename. plan is modelStagingPlan's result, nil for a
+// single file.
+func stagedFileNamesFromPlan(model *inferencev1alpha1.Model, plan *StagingPlan) []string {
+	if plan != nil {
+		return append([]string(nil), plan.Files...)
+	}
+	return []string{singleFileStagedBasename(model)}
+}
+
+// prefetchStagedFileNames is stagedFileNamesFromPlan for a Model whose plan
+// is resolved here; an unresolvable plan yields the single-file name.
+func prefetchStagedFileNames(model *inferencev1alpha1.Model) []string {
+	plan, err := modelStagingPlan(model)
+	if err != nil {
+		plan = nil
+	}
+	return stagedFileNamesFromPlan(model, plan)
+}
+
 // modelStagingPlan resolves the model's declared files into a staging plan.
 // Returns nil when there is no multi-file staging. Returns an error when
 // multi-file fields are set but resolution fails (fail-closed).
@@ -1518,16 +1552,7 @@ func buildCachedStorageConfig(model *inferencev1alpha1.Model, isvc *inferencev1a
 		}
 	}
 
-	// Match the basename the Model controller renames the file to after
-	// parsing GGUF metadata. If the controller has already populated
-	// Status.Path, use that basename verbatim so the init container's cache
-	// hit lands on the same file. Otherwise (e.g. HF repo sources where the
-	// controller does no download), use the canonical basename so the init
-	// container creates the file at the same path the controller would.
-	basename := canonicalModelBasename(model)
-	if model.Status.Path != "" {
-		basename = filepath.Base(model.Status.Path)
-	}
+	basename := singleFileStagedBasename(model)
 	modelPath := fmt.Sprintf("%s/%s", cacheDir, basename)
 
 	initVolumeMounts := []corev1.VolumeMount{

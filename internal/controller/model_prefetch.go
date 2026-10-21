@@ -787,7 +787,7 @@ func (r *ModelReconciler) reconcilePrefetchTarget(ctx context.Context, model, jo
 	builtInto, hasClaim := job.Annotations[annotationPrefetchClaim]
 	if (hasFingerprint && builtFor != fingerprint) || (hasClaim && builtInto != t.claim) {
 		logger.Info("Prefetch job was built for an earlier spec or another claim; replacing it", "job", job.Name, "claim", t.claim, "builtInto", builtInto)
-		if err := r.Delete(ctx, job, client.PropagationPolicy(metav1.DeletePropagationBackground)); err != nil && !apierrors.IsNotFound(err) {
+		if err := deletePrefetchJob(ctx, r.Client, job); err != nil {
 			return prefetchTargetOutcome{}, fmt.Errorf("deleting stale prefetch job: %w", err)
 		}
 		entry.JobName = job.Name
@@ -823,7 +823,7 @@ func (r *ModelReconciler) reconcilePrefetchTarget(ctx context.Context, model, jo
 		// requeue is for the pod states the Job object does not show.
 		reverify := job.Annotations[annotationPrefetchReverify] == "true"
 		reason := ReasonPrefetchRunning
-		message := fmt.Sprintf("prefetch job %q downloading into %q", job.Name, t.claim)
+		message := prefetchRunningMessage(job.Name, t.claim)
 		if reverify {
 			reason, message = ReasonPrefetchReverifying, prefetchReverifyMessage(job.Name, t.claim)
 		}
@@ -859,8 +859,7 @@ func (r *ModelReconciler) restageRequested(services []*inferencev1alpha1.Inferen
 		if !servicePrefetchRequested(svc) || modelCachePVCName(svc, r.ModelCacheMode) != claim {
 			continue
 		}
-		if c := meta.FindStatusCondition(svc.Status.Conditions, ConditionModelTransferHealthy); c != nil &&
-			c.Status == metav1.ConditionFalse && c.Reason == ReasonPrefetchedFilesMissing {
+		if serviceReportsPrefetchedFilesMissing(svc) {
 			return true
 		}
 	}
@@ -1050,8 +1049,7 @@ func (r *ModelReconciler) startPrefetchTarget(ctx context.Context, model, jobMod
 		setPrefetchPhase(entry, inferencev1alpha1.PrefetchPhaseSucceeded, prefetchReverifyMessage(job.Name, t.claim))
 		return prefetchTargetOutcome{requeue: prefetchPollInterval, reason: ReasonPrefetchReverifying}, nil
 	}
-	setPrefetchPhase(entry, inferencev1alpha1.PrefetchPhaseRunning,
-		fmt.Sprintf("prefetch job %q downloading into %q", job.Name, t.claim))
+	setPrefetchPhase(entry, inferencev1alpha1.PrefetchPhaseRunning, prefetchRunningMessage(job.Name, t.claim))
 	return prefetchTargetOutcome{requeue: prefetchPollInterval, reason: ReasonPrefetchStarted}, nil
 }
 
@@ -1059,6 +1057,59 @@ func (r *ModelReconciler) startPrefetchTarget(ctx context.Context, model, jobMod
 // the status already records as filled is checked again.
 func prefetchReverifyMessage(job, claim string) string {
 	return fmt.Sprintf("re-verifying claim %q with prefetch job %q: the earlier job is gone (expired or deleted); the entry stays usable, a cache hit completes in seconds", claim, job)
+}
+
+// ownedPrefetchJob returns the Job at name when it exists and model controls
+// it, else nil. The name is deterministic, so a user's Job can sit at it; a
+// Job this Model does not own is never adopted, replaced or deleted.
+func ownedPrefetchJob(ctx context.Context, c client.Reader, model *inferencev1alpha1.Model, name string) (*batchv1.Job, error) {
+	job := &batchv1.Job{}
+	if err := c.Get(ctx, types.NamespacedName{Name: name, Namespace: model.Namespace}, job); err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	if !metav1.IsControlledBy(job, model) {
+		return nil, nil
+	}
+	return job, nil
+}
+
+// deletePrefetchJob removes a prefetch Job and its pod. The API server's
+// default for Jobs is to orphan the pod, so propagation is set; a Job that
+// is already gone is not an error.
+func deletePrefetchJob(ctx context.Context, c client.Client, job *batchv1.Job) error {
+	if err := c.Delete(ctx, job, client.PropagationPolicy(metav1.DeletePropagationBackground)); err != nil && !apierrors.IsNotFound(err) {
+		return err
+	}
+	return nil
+}
+
+// prefetchRunningMessage is the entry message while a Job stages claim.
+func prefetchRunningMessage(job, claim string) string {
+	return fmt.Sprintf("prefetch job %q downloading into %q", job, claim)
+}
+
+// serviceReportsPrefetchedFilesMissing reports whether a service's pods found
+// the staged files gone from the claim they mount.
+func serviceReportsPrefetchedFilesMissing(isvc *inferencev1alpha1.InferenceService) bool {
+	c := meta.FindStatusCondition(isvc.Status.Conditions, ConditionModelTransferHealthy)
+	return c != nil && c.Status == metav1.ConditionFalse && c.Reason == ReasonPrefetchedFilesMissing
+}
+
+// unprefetchedConsumerClaim returns the claim a service's pods mount when
+// that service relies on the Model's own prefetch rather than asking for its
+// own, and would download at serve time if the claim were not staged: the
+// Model asks for prefetch, the service does not, and the pods mount a cache
+// claim (not Metal, not an ephemeral or disabled cache, not a pre-staged
+// source). ok is false otherwise. isvc must carry its effective modelCache.
+func unprefetchedConsumerClaim(isvc *inferencev1alpha1.InferenceService, model *inferencev1alpha1.Model, cacheMode, cachePath string) (string, bool) {
+	if servicePrefetchRequested(isvc) || !modelWantsPrefetch(model) || isMetalModel(model) ||
+		!modelNeedsCachePVC(model, isvc, cachePath) {
+		return "", false
+	}
+	return modelCachePVCName(isvc, cacheMode), true
 }
 
 // pruneStalePrefetch drops entries no target wants any more. A Job still
@@ -1094,18 +1145,15 @@ func (r *ModelReconciler) pruneStalePrefetch(ctx context.Context, model *inferen
 // deterministic, so a user's Job could sit at it.
 func (r *ModelReconciler) deleteOwnedPrefetchJob(ctx context.Context, model *inferencev1alpha1.Model, name, claim string) {
 	logger := logf.FromContext(ctx)
-	job := &batchv1.Job{}
-	if err := r.Get(ctx, types.NamespacedName{Name: name, Namespace: model.Namespace}, job); err != nil {
-		if !apierrors.IsNotFound(err) {
-			logger.Info("Could not read the prefetch job of an abandoned target; it finishes on its own", "job", name, "error", err.Error())
-		}
+	job, err := ownedPrefetchJob(ctx, r.Client, model, name)
+	if err != nil {
+		logger.Info("Could not read the prefetch job of an abandoned target; it finishes on its own", "job", name, "error", err.Error())
 		return
 	}
-	if !metav1.IsControlledBy(job, model) {
-		logger.Info("Job at the prefetch name is not owned by this Model; leaving it", "job", name)
+	if job == nil {
 		return
 	}
-	if err := r.Delete(ctx, job, client.PropagationPolicy(metav1.DeletePropagationBackground)); err != nil && !apierrors.IsNotFound(err) {
+	if err := deletePrefetchJob(ctx, r.Client, job); err != nil {
 		logger.Info("Could not delete the prefetch job of an abandoned target; it finishes on its own", "job", name, "error", err.Error())
 		return
 	}
@@ -1143,10 +1191,10 @@ func (r *ModelReconciler) setPrefetchTargetMismatch(model *inferencev1alpha1.Mod
 	}
 	var mismatched []string
 	for _, svc := range services {
-		if servicePrefetchRequested(svc) || modelCacheIsEphemeral(svc) || isMetalModel(model) {
+		claim, ok := unprefetchedConsumerClaim(svc, model, r.ModelCacheMode, r.ModelCachePath)
+		if !ok {
 			continue
 		}
-		claim := modelCachePVCName(svc, r.ModelCacheMode)
 		if !staged[claim] {
 			mismatched = append(mismatched, fmt.Sprintf("%s (claim %q)", svc.Name, claim))
 		}
