@@ -364,6 +364,28 @@ Limitations:
   reported as above; a pod that is scheduled but stalls (a slow or hung
   source) is visible only in its logs.
 
+### When the staged files disappear
+
+`status.prefetch` records that a claim was filled; it cannot see the claim
+afterwards. If the files go away (`llmkube cache clear`, a claim deleted and
+recreated under the same name, a wiped volume), two things bring them back
+without a rollout:
+
+- The serving pods of a service with `modelCache.prefetch` fail
+  `model-verify` with `PrefetchedFilesMissing`, which the service reports on
+  `ModelTransferHealthy`. The service then deletes the Model's prefetch Job
+  for its claim, the Model stages again, and the failing pods pass
+  `model-verify` on their next init retry. This happens once per failure
+  episode: a claim the serving node cannot reach at all stays reported
+  rather than re-staged in a loop.
+- The Model re-verifies a claim whenever its prefetch Job is gone: a day
+  after it finished (the Job's TTL), or when someone deletes it. With the
+  files still in place that is a cache hit and completes in seconds; the
+  Model stays `Ready` meanwhile and the entry reads `Running` with a
+  re-verification message. So "delete the Job" is always an available
+  retry, and a wiped claim is refilled within a day even with no pods to
+  notice.
+
 See `config/samples/model_prefetch.yaml` and
 `config/samples/model_prefetch_gitops.yaml` for complete examples.
 

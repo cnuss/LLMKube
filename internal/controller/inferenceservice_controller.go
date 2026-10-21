@@ -182,6 +182,7 @@ func initContainerSecurityContext(isvc *inferencev1alpha1.InferenceService) *cor
 // +kubebuilder:rbac:groups=inference.llmkube.dev,resources=inferenceservices/finalizers,verbs=update
 // +kubebuilder:rbac:groups=inference.llmkube.dev,resources=models,verbs=get;list;watch
 // +kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=batch,resources=jobs,verbs=get;delete
 // +kubebuilder:rbac:groups=core,resources=services,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=discovery.k8s.io,resources=endpointslices,verbs=get;list;watch;patch
 // +kubebuilder:rbac:groups=core,resources=pods,verbs=get;list;watch;create;delete
@@ -320,6 +321,9 @@ func (r *InferenceServiceReconciler) Reconcile(ctx context.Context, req ctrl.Req
 		// containers only, as the driver diagnosis scans the runtime container
 		// only, so one failure never collects two contradictory diagnoses.
 		r.reconcileModelTransferCondition(ctx, inferenceService)
+		// A prefetched claim whose files the pods found missing is staged
+		// again by deleting the Model's Job (#2136).
+		r.restagePrefetchOnMissingFiles(ctx, inferenceService, model)
 	}
 
 	endpoint := r.constructEndpoint(inferenceService, service)

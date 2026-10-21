@@ -409,6 +409,72 @@ var _ = Describe("Model Prefetch", func() {
 			Expect(progressing.Reason).To(Equal(ReasonPrefetchRunning))
 		})
 
+		// The status records that a claim was filled; it cannot see the claim.
+		// A Job that is gone (its TTL, or a deliberate delete to retry) is
+		// run again as a check, with the Model's Ready left standing.
+		It("re-verifies the claim when its Job is gone, without leaving Ready", func() {
+			model := newPrefetchModel("model-prefetch-reverify")
+			Expect(k8sClient.Create(ctx, model)).To(Succeed())
+			defer func() { _ = k8sClient.Delete(ctx, model) }()
+			modelKey := types.NamespacedName{Name: model.Name, Namespace: ns}
+			jobKey := types.NamespacedName{Name: prefetchJobName(model), Namespace: ns}
+			r := prefetchReconciler()
+
+			_, _, err := r.reconcilePrefetch(ctx, model)
+			Expect(err).NotTo(HaveOccurred())
+			completeJob(jobKey)
+			Expect(k8sClient.Get(ctx, modelKey, model)).To(Succeed())
+			_, _, err = r.reconcilePrefetch(ctx, model)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(k8sClient.Get(ctx, modelKey, model)).To(Succeed())
+			Expect(model.Status.Phase).To(Equal(PhaseReady))
+
+			By("the Job going away")
+			Expect(k8sClient.Delete(ctx, &batchv1.Job{ObjectMeta: metav1.ObjectMeta{Name: jobKey.Name, Namespace: ns}},
+				client.PropagationPolicy(metav1.DeletePropagationBackground))).To(Succeed())
+			Eventually(func() bool {
+				return apierrors.IsNotFound(k8sClient.Get(ctx, jobKey, &batchv1.Job{}))
+			}, 10*time.Second, 200*time.Millisecond).Should(BeTrue())
+
+			Expect(k8sClient.Get(ctx, modelKey, model)).To(Succeed())
+			handled, result, err := r.reconcilePrefetch(ctx, model)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(handled).To(BeTrue())
+			Expect(result.RequeueAfter).To(Equal(prefetchPollInterval))
+			Expect(k8sClient.Get(ctx, modelKey, model)).To(Succeed())
+			Expect(model.Status.Phase).To(Equal(PhaseReady), "a re-verification does not take Ready away")
+			Expect(model.Status.Prefetch[0].Phase).To(Equal(inferencev1alpha1.PrefetchPhaseRunning))
+			Expect(model.Status.Prefetch[0].Message).To(ContainSubstring("re-verifying"))
+			progressing := meta.FindStatusCondition(model.Status.Conditions, ConditionProgressing)
+			Expect(progressing).NotTo(BeNil())
+			Expect(progressing.Status).To(Equal(metav1.ConditionTrue))
+			Expect(progressing.Reason).To(Equal(ReasonPrefetchReverifying))
+			job := &batchv1.Job{}
+			Expect(k8sClient.Get(ctx, jobKey, job)).To(Succeed())
+			Expect(job.Annotations).To(HaveKeyWithValue(annotationPrefetchReverify, "true"))
+
+			By("a later pass keeping the re-verification context")
+			Expect(k8sClient.Get(ctx, modelKey, model)).To(Succeed())
+			_, _, err = r.reconcilePrefetch(ctx, model)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(k8sClient.Get(ctx, modelKey, model)).To(Succeed())
+			Expect(model.Status.Phase).To(Equal(PhaseReady))
+			Expect(meta.FindStatusCondition(model.Status.Conditions, ConditionProgressing).Reason).To(Equal(ReasonPrefetchReverifying))
+
+			By("the check completing")
+			completeJob(jobKey)
+			Expect(k8sClient.Get(ctx, modelKey, model)).To(Succeed())
+			handled, _, err = r.reconcilePrefetch(ctx, model)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(handled).To(BeFalse())
+			Expect(k8sClient.Get(ctx, modelKey, model)).To(Succeed())
+			Expect(model.Status.Phase).To(Equal(PhaseReady))
+			Expect(model.Status.Prefetch[0].Phase).To(Equal(inferencev1alpha1.PrefetchPhaseSucceeded))
+			progressing = meta.FindStatusCondition(model.Status.Conditions, ConditionProgressing)
+			Expect(progressing.Status).To(Equal(metav1.ConditionFalse))
+			Expect(progressing.Reason).To(Equal(ReasonPrefetchComplete))
+		})
+
 		// The Job name is deterministic, so a user's Job can sit at it. It is
 		// neither adopted as the prefetch nor deleted to make room.
 		It("neither adopts nor deletes a Job at the prefetch name that the Model does not own", func() {

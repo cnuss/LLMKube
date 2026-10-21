@@ -23,6 +23,7 @@ import (
 	"strings"
 
 	appsv1 "k8s.io/api/apps/v1"
+	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -62,6 +63,10 @@ const (
 	// ReasonPrefetchedFilesMissing: a serving pod built to consume a
 	// prefetched cache found a staged file absent from the claim.
 	ReasonPrefetchedFilesMissing = "PrefetchedFilesMissing"
+	// ReasonPrefetchRestaged is the event a service records when it deletes
+	// the Model's prefetch Job so the claim its pods found empty is filled
+	// again.
+	ReasonPrefetchRestaged = "PrefetchRestaged"
 )
 
 // inheritModelCache gives a service with no modelCache block of its own the
@@ -228,6 +233,55 @@ func (r *InferenceServiceReconciler) holdForPrefetch(ctx context.Context, isvc *
 	res, updateErr := r.updateStatusWithSchedulingInfo(ctx, isvc, phase, modelReady, 0, isvc.Status.Replicas, desiredReplicas, "",
 		g.message, &SchedulingInfo{Status: g.reason, Message: g.message})
 	return true, nil, replicaCounts{}, &res, updateErr
+}
+
+// restagePrefetchOnMissingFiles reacts to serving pods that found the staged
+// files gone from a claim the Model's status still records as filled (a
+// cache clear, a claim recreated under the same name). The service deletes
+// the Model's prefetch Job for its claim; the Model controller, which owns
+// the Job, recreates it as a re-verification, and the failing pods pass
+// model-verify on their next init retry with no rollout. Once per episode:
+// the condition must have transitioned after the entry last succeeded, so a
+// claim the serving node cannot reach at all is re-staged once and then
+// stays reported, not re-staged in a loop.
+func (r *InferenceServiceReconciler) restagePrefetchOnMissingFiles(ctx context.Context, isvc *inferencev1alpha1.InferenceService, model *inferencev1alpha1.Model) {
+	g := r.prefetchGate(isvc, model)
+	if !g.applies || !g.satisfied {
+		return
+	}
+	cond := meta.FindStatusCondition(isvc.Status.Conditions, ConditionModelTransferHealthy)
+	if cond == nil || cond.Status != metav1.ConditionFalse || cond.Reason != ReasonPrefetchedFilesMissing {
+		return
+	}
+	entry := findPrefetchStatus(model, g.claim)
+	if entry == nil || entry.JobName == "" {
+		return
+	}
+	if entry.LastTransitionTime != nil && !cond.LastTransitionTime.After(entry.LastTransitionTime.Time) {
+		return
+	}
+	log := logf.FromContext(ctx)
+	job := &batchv1.Job{}
+	if err := r.Get(ctx, types.NamespacedName{Name: entry.JobName, Namespace: model.Namespace}, job); err != nil {
+		// Gone already: the Model controller re-verifies on its own.
+		if !apierrors.IsNotFound(err) {
+			log.Error(err, "Failed to read the prefetch job to re-stage", "job", entry.JobName)
+		}
+		return
+	}
+	if !metav1.IsControlledBy(job, model) {
+		return
+	}
+	if err := r.Delete(ctx, job, client.PropagationPolicy(metav1.DeletePropagationBackground)); err != nil && !apierrors.IsNotFound(err) {
+		log.Error(err, "Failed to delete the prefetch job to re-stage", "job", job.Name)
+		return
+	}
+	log.Info("Serving pods found the prefetched files missing; deleted the prefetch job so the Model stages the claim again",
+		"job", job.Name, "claim", g.claim, "model", model.Name)
+	if r.Recorder != nil {
+		r.Recorder.Eventf(isvc, nil, corev1.EventTypeWarning, ReasonPrefetchRestaged, "Reconcile",
+			"pods report PrefetchedFilesMissing on claim %q; deleted prefetch job %q so Model %q stages it again", g.claim, job.Name, model.Name)
+	}
 }
 
 // warnPrefetchTargetMismatch tells a service that did not ask for its own

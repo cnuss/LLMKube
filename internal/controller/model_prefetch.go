@@ -77,6 +77,9 @@ const defaultPrefetchImage = "docker.io/curlimages/curl:8.18.0"
 const (
 	annotationPrefetchFingerprint = "inference.llmkube.dev/prefetch-fingerprint"
 	annotationPrefetchClaim       = "inference.llmkube.dev/prefetch-claim"
+	// annotationPrefetchReverify marks a Job that reruns a staging the status
+	// already records, because the earlier Job is gone.
+	annotationPrefetchReverify = "inference.llmkube.dev/prefetch-reverify"
 )
 
 // Model conditions and reasons written by the prefetch path.
@@ -100,6 +103,10 @@ const (
 	// ReasonPrefetchUnschedulable: the Job's pod cannot be scheduled, so the
 	// download has not started. Placement (or the claim's node) is the fix.
 	ReasonPrefetchUnschedulable = "PrefetchUnschedulable"
+	// ReasonPrefetchReverifying: the claim was staged earlier and its Job is
+	// gone, so a new Job checks the files are still there. A cache hit makes
+	// it short; the Model stays Ready meanwhile.
+	ReasonPrefetchReverifying = "PrefetchReverifying"
 )
 
 const (
@@ -541,17 +548,38 @@ func (r *ModelReconciler) reconcilePrefetchState(ctx context.Context, model *inf
 // Model that asked to be prefetched is Downloading until its target succeeds,
 // Ready after, and Failed or Pending when the Job is.
 func (r *ModelReconciler) gateModelOnOwnPrefetch(ctx context.Context, model *inferencev1alpha1.Model, plan *StagingPlan, entry *inferencev1alpha1.PrefetchStatus, outcome prefetchTargetOutcome, ownReason string, requeue time.Duration) (bool, ctrl.Result, error) {
+	gen, written := availableObservedGeneration(model)
+	readyForSpec := model.Status.Phase == PhaseReady && written && gen == model.Generation
 	switch entry.Phase {
 	case inferencev1alpha1.PrefetchPhaseSucceeded:
-		gen, written := availableObservedGeneration(model)
-		if model.Status.Phase == PhaseReady && written && gen == model.Generation {
+		if readyForSpec {
 			// Completed earlier: the cache is warm and status is terminal.
 			// Fall through so the ordinary remote-source reconcile keeps
-			// owning Ready (revalidation, accelerator checks).
+			// owning Ready (revalidation, accelerator checks). A
+			// re-verification that just finished leaves Progressing True.
+			if c := meta.FindStatusCondition(model.Status.Conditions, ConditionProgressing); c != nil && c.Status == metav1.ConditionTrue {
+				setCondition(model, ConditionProgressing, metav1.ConditionFalse, ReasonPrefetchComplete, "Prefetch re-verified the claim")
+			}
 			return false, ctrl.Result{RequeueAfter: requeue}, nil
 		}
 		r.completePrefetch(ctx, model, plan)
 		return true, ctrl.Result{}, nil
+	case inferencev1alpha1.PrefetchPhasePending, inferencev1alpha1.PrefetchPhaseRunning:
+		if readyForSpec {
+			// A re-verification, or a hold that followed one: the files this
+			// generation was declared Ready on are not in question until the
+			// Job says so, so Ready stands and Progressing carries the state.
+			meta.SetStatusCondition(&model.Status.Conditions, metav1.Condition{
+				Type:               ConditionProgressing,
+				Status:             metav1.ConditionTrue,
+				ObservedGeneration: model.Generation,
+				Reason:             outcome.reason,
+				Message:            entry.Message,
+			})
+			return true, ctrl.Result{RequeueAfter: requeue}, nil
+		}
+	}
+	switch entry.Phase {
 	case inferencev1alpha1.PrefetchPhaseFailed:
 		model.Status.Phase = PhaseFailed
 		setCondition(model, ConditionProgressing, metav1.ConditionFalse, ReasonPrefetchFailed, entry.Message)
@@ -605,13 +633,12 @@ func progressingReason(model *inferencev1alpha1.Model) string {
 // with the desired fingerprint.
 func (r *ModelReconciler) reconcilePrefetchTarget(ctx context.Context, model, jobModel *inferencev1alpha1.Model, t prefetchTarget, fingerprint string, entry *inferencev1alpha1.PrefetchStatus) (prefetchTargetOutcome, error) {
 	logger := logf.FromContext(ctx)
-
-	// Already staged for this spec. The Job may be gone (TTL); the entry is
-	// the record. Only the generation moves.
-	if entry.Phase == inferencev1alpha1.PrefetchPhaseSucceeded && entry.Fingerprint == fingerprint {
-		entry.ObservedGeneration = model.Generation
-		return prefetchTargetOutcome{reason: ReasonPrefetchComplete}, nil
-	}
+	// Staged earlier for this spec. The Job is read anyway: while it exists
+	// the entry stands; once it is gone (its TTL, or someone deleted it to
+	// retry) the claim is re-verified by running it again. The status cannot
+	// see the claim, so the Job's lifetime bounds how long a wiped claim can
+	// pass as prefetched.
+	staged := entry.Phase == inferencev1alpha1.PrefetchPhaseSucceeded && entry.Fingerprint == fingerprint
 
 	jobName := entry.JobName
 	if jobName == "" {
@@ -637,7 +664,7 @@ func (r *ModelReconciler) reconcilePrefetchTarget(ctx context.Context, model, jo
 	err := r.Get(getCtx, types.NamespacedName{Name: jobName, Namespace: model.Namespace}, job)
 	switch {
 	case apierrors.IsNotFound(err):
-		return r.startPrefetchTarget(ctx, model, jobModel, t, fingerprint, entry, jobName)
+		return r.startPrefetchTarget(ctx, model, jobModel, t, fingerprint, entry, jobName, staged)
 	case err != nil:
 		return prefetchTargetOutcome{}, fmt.Errorf("checking prefetch job: %w", err)
 	}
@@ -693,6 +720,9 @@ func (r *ModelReconciler) reconcilePrefetchTarget(ctx context.Context, model, jo
 		// status honest without watching Jobs from this controller.
 		reason := ReasonPrefetchRunning
 		message := fmt.Sprintf("prefetch job %q downloading into %q", job.Name, t.claim)
+		if job.Annotations[annotationPrefetchReverify] == "true" {
+			reason, message = ReasonPrefetchReverifying, prefetchReverifyMessage(job.Name, t.claim)
+		}
 		// A Job whose pod cannot be scheduled never completes and never
 		// fails: a placement that keeps the download off the GPU nodes
 		// cannot reach a claim that lives on one of them. Say so rather than
@@ -735,7 +765,7 @@ func (r *ModelReconciler) prefetchJobUnschedulable(ctx context.Context, job *bat
 
 // startPrefetchTarget makes sure the target claim exists (the shared cache is
 // provisioned; any other claim must already exist) and creates the Job.
-func (r *ModelReconciler) startPrefetchTarget(ctx context.Context, model, jobModel *inferencev1alpha1.Model, t prefetchTarget, fingerprint string, entry *inferencev1alpha1.PrefetchStatus, jobName string) (prefetchTargetOutcome, error) {
+func (r *ModelReconciler) startPrefetchTarget(ctx context.Context, model, jobModel *inferencev1alpha1.Model, t prefetchTarget, fingerprint string, entry *inferencev1alpha1.PrefetchStatus, jobName string, reverify bool) (prefetchTargetOutcome, error) {
 	logger := logf.FromContext(ctx)
 
 	if t.claim == ModelCachePVCName {
@@ -765,6 +795,9 @@ func (r *ModelReconciler) startPrefetchTarget(ctx context.Context, model, jobMod
 		return prefetchTargetOutcome{reason: ReasonPrefetchFailed}, nil
 	}
 	job.Name = jobName
+	if reverify {
+		job.Annotations[annotationPrefetchReverify] = "true"
+	}
 
 	// The Job pod mounts the CA ConfigMap from the Model's namespace like the
 	// serving pod does. Without it the pod wedges in ContainerCreating, the
@@ -797,13 +830,23 @@ func (r *ModelReconciler) startPrefetchTarget(ctx context.Context, model, jobMod
 		return prefetchTargetOutcome{}, fmt.Errorf("creating prefetch job: %w", err)
 	}
 
-	logger.Info("Created prefetch job", "job", job.Name, "claim", t.claim, "requestedBy", t.requestedBy)
+	logger.Info("Created prefetch job", "job", job.Name, "claim", t.claim, "requestedBy", t.requestedBy, "reverify", reverify)
 	entry.JobName = job.Name
 	entry.Fingerprint = fingerprint
 	entry.ObservedGeneration = model.Generation
-	setPrefetchPhase(entry, inferencev1alpha1.PrefetchPhaseRunning,
-		fmt.Sprintf("prefetch job %q downloading into %q", job.Name, t.claim))
-	return prefetchTargetOutcome{requeue: prefetchPollInterval, reason: ReasonPrefetchStarted}, nil
+	reason := ReasonPrefetchStarted
+	message := fmt.Sprintf("prefetch job %q downloading into %q", job.Name, t.claim)
+	if reverify {
+		reason, message = ReasonPrefetchReverifying, prefetchReverifyMessage(job.Name, t.claim)
+	}
+	setPrefetchPhase(entry, inferencev1alpha1.PrefetchPhaseRunning, message)
+	return prefetchTargetOutcome{requeue: prefetchPollInterval, reason: reason}, nil
+}
+
+// prefetchReverifyMessage is the entry and condition message while a claim
+// the status already records as filled is checked again.
+func prefetchReverifyMessage(job, claim string) string {
+	return fmt.Sprintf("re-verifying claim %q with prefetch job %q: the earlier job is gone (expired or deleted); a cache hit completes in seconds", claim, job)
 }
 
 // pruneStalePrefetch drops entries no target wants any more. A Job still

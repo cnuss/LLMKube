@@ -309,6 +309,75 @@ var _ = Describe("InferenceService modelCache.prefetch (#2136)", func() {
 		Expect(cond.Message).To(ContainSubstring("failed"))
 	})
 
+	// A cache clear or a recreated claim empties what the status still
+	// records as filled. The pods say so; the service turns that into a
+	// re-stage by deleting the Job, once per episode.
+	It("deletes the prefetch Job once when its pods report the staged files missing", func() {
+		createCachePVC(ctx, ns, "wiped-cache")
+		model := readyModel("wiped-model", "https://example.com/models/llama.gguf", nil)
+		isvc := newService("wiped", model.Name, &inferencev1alpha1.ModelCacheSpec{ClaimName: "wiped-cache", Prefetch: true})
+		mr := modelReconciler()
+		ir := isvcReconciler()
+		recorder := events.NewFakeRecorder(50)
+		ir.Recorder = recorder
+		jobKey := types.NamespacedName{Name: prefetchTargetJobName(model, "wiped-cache"), Namespace: ns}
+
+		prefetchModel(mr, model.Name)
+		markJobComplete(ctx, jobKey)
+		model, _, _ = prefetchModel(mr, model.Name)
+		Expect(findPrefetchStatus(model, "wiped-cache").Phase).To(Equal(inferencev1alpha1.PrefetchPhaseSucceeded))
+		reconcileService(ir, isvc.Name)
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: isvc.Name, Namespace: ns}, &appsv1.Deployment{})).To(Succeed())
+
+		By("a serving pod failing model-verify on the emptied claim")
+		// Status times have second resolution; the failure must be seen
+		// after the staging completed.
+		time.Sleep(1100 * time.Millisecond)
+		pod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Name: isvc.Name + "-7f9c4", Namespace: ns,
+				Labels: map[string]string{"app": isvc.Name, "inference.llmkube.dev/service": isvc.Name}},
+			Spec: corev1.PodSpec{
+				InitContainers: []corev1.Container{{Name: "model-verify", Image: "busybox"}},
+				Containers:     []corev1.Container{{Name: "x", Image: "busybox"}},
+			},
+		}
+		Expect(k8sClient.Create(ctx, pod)).To(Succeed())
+		DeferCleanup(func() { _ = k8sClient.Delete(ctx, pod) })
+		pod.Status.Phase = corev1.PodPending
+		pod.Status.InitContainerStatuses = []corev1.ContainerStatus{{
+			Name: "model-verify",
+			State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{
+				ExitCode: 1,
+				Message:  "ERROR: PrefetchedFilesMissing - /models/abc/llama.gguf is not on the cache claim.",
+			}},
+		}}
+		Expect(k8sClient.Status().Update(ctx, pod)).To(Succeed())
+
+		got := reconcileService(ir, isvc.Name)
+		transfer := meta.FindStatusCondition(got.Status.Conditions, ConditionModelTransferHealthy)
+		Expect(transfer).NotTo(BeNil())
+		Expect(transfer.Reason).To(Equal(ReasonPrefetchedFilesMissing))
+		Expect(apierrors.IsNotFound(k8sClient.Get(ctx, jobKey, &batchv1.Job{}))).To(BeTrue(),
+			"the prefetch Job is deleted so the Model stages the claim again")
+		Expect(drainEvents(recorder)).To(ContainElement(HavePrefix("Warning " + ReasonPrefetchRestaged)))
+
+		By("the Model re-staging the claim with its Ready untouched")
+		model, _, _ = prefetchModel(mr, model.Name)
+		Expect(model.Status.Phase).To(Equal(PhaseReady))
+		entry := findPrefetchStatus(model, "wiped-cache")
+		Expect(entry.Phase).To(Equal(inferencev1alpha1.PrefetchPhaseRunning))
+		Expect(entry.Message).To(ContainSubstring("re-verifying"))
+		Expect(k8sClient.Get(ctx, jobKey, &batchv1.Job{})).To(Succeed())
+
+		By("leaving the new Job alone for the same failure episode")
+		markJobComplete(ctx, jobKey)
+		model, _, _ = prefetchModel(mr, model.Name)
+		Expect(findPrefetchStatus(model, "wiped-cache").Phase).To(Equal(inferencev1alpha1.PrefetchPhaseSucceeded))
+		reconcileService(ir, isvc.Name)
+		Expect(k8sClient.Get(ctx, jobKey, &batchv1.Job{})).To(Succeed(),
+			"a failure observed before the re-stage completed does not trigger another")
+	})
+
 	It("reports PrefetchFailed on a first rollout and creates nothing", func() {
 		createCachePVC(ctx, ns, "fail-cache")
 		model := readyModel("fail-first-model", "https://example.com/models/llama.gguf", nil)
