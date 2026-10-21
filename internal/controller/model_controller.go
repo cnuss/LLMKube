@@ -1702,14 +1702,9 @@ func (r *ModelReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		For(&inferencev1alpha1.Model{}).
 		Named("model").
 		WithOptions(controller.Options{MaxConcurrentReconciles: ModelReconcileConcurrency}).
-		// The prefetch Jobs this controller creates: a completion, failure or
-		// deletion (a TTL expiry, or a service asking for a re-stage) is then
-		// a prompt event rather than a poll, and a deleted Job is recreated
-		// as a re-verification of its claim (#2136). Trade-off against the
-		// lazy read of #1597: the Job informer now starts with the manager,
-		// so a cluster whose RBAC cannot list or watch Jobs fails the cache
-		// sync at startup instead of degrading prefetch alone. The chart has
-		// granted batch/jobs since #1593 and the generated-RBAC e2e covers it.
+		// The prefetch Jobs this controller creates. Their informer starts
+		// with the manager: RBAC must allow list and watch on batch/jobs, or
+		// the cache sync fails at startup.
 		Owns(&batchv1.Job{}).
 		// A service created or retargeted after its Model moves the prefetch
 		// target (#2136). Spec changes only: a service's status writes must

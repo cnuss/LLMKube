@@ -501,6 +501,12 @@ type PrefetchStatus struct {
 	// +kubebuilder:validation:MinLength=1
 	ClaimName string `json:"claimName"`
 
+	// Own marks the Model's own prefetch target (spec.prefetch), the entry
+	// that gates the Model's Ready. Entries an InferenceService requested
+	// leave it unset.
+	// +optional
+	Own bool `json:"own,omitempty"`
+
 	// CacheKey is the cache directory under the claim the files land in.
 	// +optional
 	CacheKey string `json:"cacheKey,omitempty"`

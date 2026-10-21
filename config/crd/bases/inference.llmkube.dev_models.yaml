@@ -1899,6 +1899,12 @@ spec:
                         the Model's as not yet current.
                       format: int64
                       type: integer
+                    own:
+                      description: |-
+                        Own marks the Model's own prefetch target (spec.prefetch), the entry
+                        that gates the Model's Ready. Entries an InferenceService requested
+                        leave it unset.
+                      type: boolean
                     phase:
                       description: Phase is Pending, Running, Succeeded or Failed.
                       enum:

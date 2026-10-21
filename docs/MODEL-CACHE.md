@@ -299,6 +299,16 @@ With the field set:
   condition) rather than downloading on the serving node. The pods also get
   `HF_HUB_OFFLINE=1` and `TRANSFORMERS_OFFLINE=1`, so a runtime cannot reach
   the Hub through a path the operator does not model.
+- Use a `ReadWriteMany` (or `ReadOnlyMany`) claim when the serving pods run
+  on other nodes than the Job. A `ReadWriteOnce` claim attaches to one node:
+  the first staging works because the Job finishes before the pods attach,
+  but a later re-stage or re-verification while pods mount the claim
+  elsewhere stalls on `Multi-Attach` and is reported as `PrefetchStalled`.
+  On a single-writer claim the Model therefore skips the routine
+  re-verification while a pod mounts the claim (the entry says so and
+  stays usable), and a re-stage after `PrefetchedFilesMissing` still runs
+  but needs the consuming service suspended (`spec.suspend`) to release
+  the attachment when the Job lands on another node.
 - `prefetch: true` means "serve only from a prefetched cache". A request the
   pods could not consume is refused, not ignored: the service reports
   `ModelPrefetched=False` with reason `PrefetchUnsupported`, creates no pods

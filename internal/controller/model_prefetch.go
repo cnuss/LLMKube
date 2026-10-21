@@ -21,6 +21,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -125,27 +126,67 @@ const (
 	prefetchRetryInterval = 5 * time.Second
 	// prefetchClaimWait is the retry while a target claim does not exist yet
 	// (a user-owned claim still to be created, or a perService claim the
-	// InferenceService controller has not provisioned).
+	// InferenceService controller has not provisioned), and while the
+	// InferenceService listing fails.
 	prefetchClaimWait = 30 * time.Second
+	// prefetchReverifyRetry is the retry while a routine re-verification
+	// waits for a single-writer claim to be unmounted.
+	prefetchReverifyRetry = 10 * time.Minute
 )
 
 // prefetchPodStartGrace is how long a scheduled Job pod may stay Pending
 // before the entry names it as stalled. A variable so a test can shrink it.
 var prefetchPodStartGrace = 5 * time.Minute
 
-// prefetchJobName returns the Job name for the Model's own prefetch target.
-// It predates per-claim tracking, so a Job a previous controller created is
-// found and adopted under this name.
+// maxPrefetchJobNameLength is the longest Job name whose pods' job-name
+// label is still valid.
+const maxPrefetchJobNameLength = 63
+
+// prefetchJobName is the Job name of the Model's own prefetch target, and
+// the name under which a Job created before per-claim naming is found.
 func prefetchJobName(model *inferencev1alpha1.Model) string {
-	return model.Name + "-prefetch"
+	return prefetchJobNameFor(model.Name, "-prefetch")
 }
 
-// prefetchTargetJobName returns the Job name for a prefetch into claim that
-// an InferenceService requested: one Job per claim, named by the claim's
-// hash so two services sharing a claim share the Job.
+// prefetchTargetJobName is the Job name for a prefetch into claim: one Job
+// per claim, named by the claim's hash so two services sharing a claim share
+// the Job.
 func prefetchTargetJobName(model *inferencev1alpha1.Model, claim string) string {
 	sum := sha256.Sum256([]byte(claim))
-	return model.Name + "-prefetch-" + hex.EncodeToString(sum[:])[:8]
+	return prefetchJobNameFor(model.Name, "-prefetch-"+hex.EncodeToString(sum[:])[:8])
+}
+
+// prefetchJobNameFor appends suffix to the Model name, shortening the name
+// part so the Job name fits the pod label the Job controller derives from it.
+func prefetchJobNameFor(modelName, suffix string) string {
+	if room := maxPrefetchJobNameLength - len(suffix); len(modelName) > room {
+		modelName = strings.TrimRight(modelName[:room], "-.")
+	}
+	return modelName + suffix
+}
+
+// prefetchJobNameInUse reports whether an entry other than claim's already
+// drives a Job by name. Two targets must never resolve one Job name, or they
+// replace each other's Job without end.
+func prefetchJobNameInUse(model *inferencev1alpha1.Model, name, claim string) bool {
+	for _, e := range model.Status.Prefetch {
+		if e.JobName == name && e.ClaimName != claim {
+			return true
+		}
+	}
+	return false
+}
+
+// stagedClaimFor returns the Model's own target claim already staged for
+// fingerprint, or "". A claim a service requested is not an own target: the
+// Model's Ready must not rest on a claim that goes away with that service.
+func stagedClaimFor(model *inferencev1alpha1.Model, fingerprint string) string {
+	for _, e := range model.Status.Prefetch {
+		if e.Own && e.Phase == inferencev1alpha1.PrefetchPhaseSucceeded && e.Fingerprint == fingerprint {
+			return e.ClaimName
+		}
+	}
+	return ""
 }
 
 // seedPrefetchCacheKey sets Status.CacheKey (in memory) to the key the source
@@ -216,10 +257,8 @@ func servicePrefetchRequested(isvc *inferencev1alpha1.InferenceService) bool {
 		isvc.Spec.ModelCache.Persistence != inferencev1alpha1.ModelCachePersistenceEphemeral
 }
 
-// DefaultPrefetchJobReadTimeout bounds the read of the prefetch Job (#1597).
-// The Job informer now starts with the manager (Owns(Job)), so the lazy sync
-// the bound was written for no longer happens here; it stays as a ceiling on
-// any cache read that cannot complete.
+// DefaultPrefetchJobReadTimeout bounds the read of the prefetch Job, so a
+// cache read that cannot complete does not hold a shared reconcile worker.
 const DefaultPrefetchJobReadTimeout = 30 * time.Second
 
 // prefetchJobReadTimeout returns the configured bound, or the default.
@@ -501,6 +540,10 @@ func (r *ModelReconciler) reconcilePrefetchState(ctx context.Context, model *inf
 		requested = requested || servicePrefetchRequested(svc)
 	}
 	if !requested {
+		if listErr != nil {
+			// Service requests are unknown this pass; their Jobs stay.
+			return false, ctrl.Result{RequeueAfter: prefetchClaimWait}, nil
+		}
 		r.pruneStalePrefetch(ctx, model, nil, "")
 		meta.RemoveStatusCondition(&model.Status.Conditions, ConditionPrefetchTargetMismatch)
 		return false, ctrl.Result{}, nil
@@ -527,37 +570,44 @@ func (r *ModelReconciler) reconcilePrefetchState(ctx context.Context, model *inf
 	seedPrefetchCacheKey(model)
 	fingerprint := prefetchFingerprint(model, plan)
 	jobModel := prefetchJobModel(model, plan)
-	stagedClaim := ""
-	for _, e := range model.Status.Prefetch {
-		if e.Phase == inferencev1alpha1.PrefetchPhaseSucceeded && e.Fingerprint == fingerprint {
-			stagedClaim = e.ClaimName
-			break
-		}
-	}
-	targets, ownReason := r.prefetchTargets(model, services, listErr, stagedClaim)
+	targets, ownReason := r.prefetchTargets(model, services, listErr, stagedClaimFor(model, fingerprint))
 
 	var (
 		requeue    time.Duration
 		ownOutcome prefetchTargetOutcome
-		ownEntry   *inferencev1alpha1.PrefetchStatus
+		ownClaim   string
 	)
 	for _, t := range targets {
 		entry := ensurePrefetchStatus(model, t.claim)
 		entry.CacheKey = effectiveModelCacheKey(model)
-		outcome, err := r.reconcilePrefetchTarget(ctx, model, jobModel, t, fingerprint, entry)
+		entry.Own = t.own
+		outcome, err := r.reconcilePrefetchTarget(ctx, model, jobModel, t, fingerprint, entry, services)
 		if err != nil {
 			return true, ctrl.Result{}, err
 		}
 		requeue = earliestPositive(requeue, outcome.requeue)
 		if t.own {
 			ownOutcome = outcome
-			ownEntry = findPrefetchStatus(model, t.claim)
+			ownClaim = t.claim
 		}
 	}
-	r.pruneStalePrefetch(ctx, model, targets, fingerprint)
-	r.setPrefetchTargetMismatch(model, services, targets)
+	if listErr != nil {
+		// The service requests are unknown this pass, so nothing is pruned
+		// and no mismatch is judged; the Jobs they drive stay.
+		requeue = earliestPositive(requeue, prefetchClaimWait)
+	} else {
+		r.pruneStalePrefetch(ctx, model, targets, fingerprint)
+		r.setPrefetchTargetMismatch(model, services, targets)
+	}
 
 	if !wantsOwn {
+		return false, ctrl.Result{RequeueAfter: requeue}, nil
+	}
+	// Looked up after the prune: it compacts the slice in place, and an
+	// append for a later target can move it, so a pointer taken in the loop
+	// may name another claim's entry by now.
+	ownEntry := findPrefetchStatus(model, ownClaim)
+	if ownEntry == nil {
 		return false, ctrl.Result{RequeueAfter: requeue}, nil
 	}
 	return r.gateModelOnOwnPrefetch(ctx, model, plan, ownEntry, ownOutcome, ownReason, requeue)
@@ -668,7 +718,7 @@ func progressingReason(model *inferencev1alpha1.Model) string {
 
 // reconcilePrefetchTarget brings one target's Job and status entry in line
 // with the desired fingerprint.
-func (r *ModelReconciler) reconcilePrefetchTarget(ctx context.Context, model, jobModel *inferencev1alpha1.Model, t prefetchTarget, fingerprint string, entry *inferencev1alpha1.PrefetchStatus) (prefetchTargetOutcome, error) {
+func (r *ModelReconciler) reconcilePrefetchTarget(ctx context.Context, model, jobModel *inferencev1alpha1.Model, t prefetchTarget, fingerprint string, entry *inferencev1alpha1.PrefetchStatus, services []*inferencev1alpha1.InferenceService) (prefetchTargetOutcome, error) {
 	logger := logf.FromContext(ctx)
 	// Staged earlier for this spec. The Job is read anyway: while it exists
 	// the entry stands; once it is gone (its TTL, or someone deleted it to
@@ -679,17 +729,16 @@ func (r *ModelReconciler) reconcilePrefetchTarget(ctx context.Context, model, jo
 
 	jobName := entry.JobName
 	if jobName == "" {
-		if t.own {
+		jobName = prefetchTargetJobName(model, t.claim)
+		// The Model's own target keeps the claim-less name unless another
+		// entry already drives a Job by it.
+		if t.own && !prefetchJobNameInUse(model, prefetchJobName(model), t.claim) {
 			jobName = prefetchJobName(model)
-		} else {
-			jobName = prefetchTargetJobName(model, t.claim)
 		}
 	}
 
-	// Bounded read (#1597). The Job informer starts with the manager now
-	// that the controller owns its Jobs, so the lazy sync this bound was
-	// written for no longer happens here; it stays as a ceiling so no cache
-	// read can hold a shared worker.
+	// Bounded read: a cache read that cannot complete must not hold a
+	// shared reconcile worker.
 	getCtx, cancel := context.WithTimeout(ctx, r.prefetchJobReadTimeout())
 	defer cancel()
 
@@ -697,6 +746,18 @@ func (r *ModelReconciler) reconcilePrefetchTarget(ctx context.Context, model, jo
 	err := r.Get(getCtx, types.NamespacedName{Name: jobName, Namespace: model.Namespace}, job)
 	switch {
 	case apierrors.IsNotFound(err):
+		// A check Job on a single-writer claim that a pod has attached
+		// elsewhere stalls on Multi-Attach, so a routine re-verification
+		// waits for the claim to be free. A re-stage a service asked for
+		// (its pods report the files missing) runs regardless: those pods
+		// fail either way, and the message names what frees the claim.
+		if staged && !r.restageRequested(services, t.claim) {
+			if pod, mode := r.singleWriterClaimHolder(ctx, model.Namespace, t.claim); pod != "" {
+				setPrefetchPhase(entry, inferencev1alpha1.PrefetchPhaseSucceeded,
+					fmt.Sprintf("re-verification of claim %q waits: the claim is %s and mounted by pod %q, so a check job could only run on that pod's node; it runs once the claim is free", t.claim, mode, pod))
+				return prefetchTargetOutcome{requeue: prefetchReverifyRetry, reason: ReasonPrefetchComplete}, nil
+			}
+		}
 		return r.startPrefetchTarget(ctx, model, jobModel, t, fingerprint, entry, jobName, staged)
 	case err != nil:
 		return prefetchTargetOutcome{}, fmt.Errorf("checking prefetch job: %w", err)
@@ -791,6 +852,59 @@ func (r *ModelReconciler) reconcilePrefetchTarget(ctx context.Context, model, jo
 	}
 }
 
+// restageRequested reports whether a service consuming claim says its pods
+// found the staged files missing, which is a request to stage again.
+func (r *ModelReconciler) restageRequested(services []*inferencev1alpha1.InferenceService, claim string) bool {
+	for _, svc := range services {
+		if !servicePrefetchRequested(svc) || modelCachePVCName(svc, r.ModelCacheMode) != claim {
+			continue
+		}
+		if c := meta.FindStatusCondition(svc.Status.Conditions, ConditionModelTransferHealthy); c != nil &&
+			c.Status == metav1.ConditionFalse && c.Reason == ReasonPrefetchedFilesMissing {
+			return true
+		}
+	}
+	return false
+}
+
+// singleWriterClaimHolder returns a pod that mounts claim, and the claim's
+// access mode, when the claim allows no second writer (ReadWriteOnce,
+// ReadWriteOncePod); "" when the claim is shareable, unmounted, or unknown.
+func (r *ModelReconciler) singleWriterClaimHolder(ctx context.Context, namespace, claim string) (string, string) {
+	pvc := &corev1.PersistentVolumeClaim{}
+	if err := r.Get(ctx, types.NamespacedName{Name: claim, Namespace: namespace}, pvc); err != nil {
+		return "", ""
+	}
+	mode := ""
+	for _, m := range pvc.Spec.AccessModes {
+		switch m {
+		case corev1.ReadWriteMany, corev1.ReadOnlyMany:
+			return "", ""
+		case corev1.ReadWriteOnce, corev1.ReadWriteOncePod:
+			mode = string(m)
+		}
+	}
+	if mode == "" {
+		return "", ""
+	}
+	pods := &corev1.PodList{}
+	if err := r.List(ctx, pods, client.InNamespace(namespace)); err != nil {
+		return "", ""
+	}
+	for i := range pods.Items {
+		pod := &pods.Items[i]
+		if pod.Status.Phase == corev1.PodSucceeded || pod.Status.Phase == corev1.PodFailed {
+			continue
+		}
+		for _, v := range pod.Spec.Volumes {
+			if v.PersistentVolumeClaim != nil && v.PersistentVolumeClaim.ClaimName == claim {
+				return pod.Name, mode
+			}
+		}
+	}
+	return "", ""
+}
+
 // prefetchJobBlocked reports a Job pod that is Pending and cannot be
 // scheduled (the scheduler's message), or was scheduled and has not started
 // within prefetchPodStartGrace (the waiting reason of its first container),
@@ -830,8 +944,12 @@ func (r *ModelReconciler) prefetchJobBlocked(ctx context.Context, job *batchv1.J
 				break
 			}
 		}
-		return ReasonPrefetchStalled, fmt.Sprintf("pod %q has been Pending on node %q for %s after scheduling; %s",
+		detail := fmt.Sprintf("pod %q has been Pending on node %q for %s after scheduling; %s",
 			pod.Name, pod.Spec.NodeName, time.Since(pod.CreationTimestamp.Time).Round(time.Second), waiting)
+		if strings.Contains(waiting, "Multi-Attach") {
+			detail += ". The claim is attached on another node: suspend the consuming service (spec.suspend) to release it, or use a ReadWriteMany claim"
+		}
+		return ReasonPrefetchStalled, detail
 	}
 	return "", ""
 }
@@ -860,6 +978,15 @@ func (r *ModelReconciler) startPrefetchTarget(ctx context.Context, model, jobMod
 				fmt.Sprintf("cache claim %q does not exist in namespace %q; the prefetch job starts once it does", t.claim, model.Namespace))
 			return prefetchTargetOutcome{requeue: prefetchClaimWait, reason: ReasonPrefetchClaimNotFound}, nil
 		}
+	}
+
+	// The names this Job writes. A re-verification keeps the entry's
+	// recorded names, which consumers serve; names that differ from them
+	// mean the Job writes new files, so that is a fresh staging consumers
+	// wait for, not a check of what they already have.
+	names := prefetchStagedFileNames(jobModel)
+	if reverify && len(entry.Files) > 0 && !slices.Equal(names, entry.Files) {
+		reverify = false
 	}
 
 	job, err := r.buildPrefetchJob(ctx, jobModel, t.claim, fingerprint)
@@ -900,6 +1027,13 @@ func (r *ModelReconciler) startPrefetchTarget(ctx context.Context, model, jobMod
 			// Raced with a concurrent reconcile; the poll branch takes over.
 			return prefetchTargetOutcome{requeue: prefetchRetryInterval, reason: ReasonPrefetchRunning}, nil
 		}
+		if apierrors.IsInvalid(err) {
+			// The API server will reject it the same way every time: this
+			// target fails, the Model's other work goes on.
+			setPrefetchPhase(entry, inferencev1alpha1.PrefetchPhaseFailed,
+				fmt.Sprintf("prefetch job %q was rejected: %v", job.Name, err))
+			return prefetchTargetOutcome{reason: ReasonPrefetchFailed}, nil
+		}
 		return prefetchTargetOutcome{}, fmt.Errorf("creating prefetch job: %w", err)
 	}
 
@@ -907,7 +1041,9 @@ func (r *ModelReconciler) startPrefetchTarget(ctx context.Context, model, jobMod
 	entry.JobName = job.Name
 	entry.Fingerprint = fingerprint
 	entry.ObservedGeneration = model.Generation
-	entry.Files = prefetchStagedFileNames(jobModel)
+	if !reverify {
+		entry.Files = names
+	}
 	if reverify {
 		// The entry stays Succeeded: consumers keep serving what they have
 		// while the check runs. A failed check moves it to Failed.

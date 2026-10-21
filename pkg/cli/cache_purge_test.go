@@ -643,6 +643,11 @@ func TestTargetedClaims(t *testing.T) {
 	}
 
 	modelClaim := purgeTarget{Name: "model-cache", UserOwned: true}
+	svcWithBlock := func(name, modelRef string) inferencev1alpha1.InferenceService {
+		s := svc(name, modelRef, "")
+		s.Spec.ModelCache = &inferencev1alpha1.ModelCacheSpec{Prefetch: true}
+		return s
+	}
 
 	tests := []struct {
 		name       string
@@ -661,6 +666,24 @@ func TestTargetedClaims(t *testing.T) {
 			model:      "glm",
 			modelClaim: "model-cache",
 			want:       []string{"model-cache"},
+		},
+		{
+			// A block of its own, even one naming no claim, mounts the
+			// default claim, as the controller resolves it.
+			name:       "a service with its own modelCache block does not inherit the Model's claim",
+			all:        []purgeTarget{shared, modelClaim},
+			svcs:       []inferencev1alpha1.InferenceService{svcWithBlock("glm", "glm")},
+			model:      "glm",
+			modelClaim: "model-cache",
+			want:       []string{"llmkube-model-cache", "model-cache"},
+		},
+		{
+			name:       "a service named after the model but referencing another does not inherit",
+			all:        []purgeTarget{shared, modelClaim},
+			svcs:       []inferencev1alpha1.InferenceService{svc("glm", "other-model", "")},
+			model:      "glm",
+			modelClaim: "model-cache",
+			want:       []string{"llmkube-model-cache", "model-cache"},
 		},
 		{
 			name:       "a prefetch-era Model with no service targets its own claim, not the shared cache",

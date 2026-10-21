@@ -108,22 +108,19 @@ type purgeTarget struct {
 }
 
 // targetedClaims narrows the claims in a namespace to the ones that can hold
-// modelName's files: the claims the model's own InferenceServices bring with
-// spec.modelCache.claimName, and the claim each of those services' pods mounts
-// otherwise, which is the service's "<isvc>-model-cache" only in perService
-// mode and the shared cache in the default shared mode (internal/controller
-// modelCachePVCName). The shared cache also counts when the Model has no
-// InferenceService the purge could consult (prefetch-era Models, or a service
-// not yet created), so a model that demonstrably lives on per-service or
-// override claims never costs a pod on the shared claim, which a shared-mode
-// service may hold under RWO. The claims of services that do not reference the
-// model stay untouched, so clearing one model does not create a read-write pod
-// on every running service's volume or fail on their attach timeouts. all is
-// every cache claim in the namespace, in the order cachePVCandidates returns.
-//
-// modelClaim is the Model's own spec.modelCache.claimName: the prefetch
-// target when set, whether or not a service exists yet, so a prefetch-era
-// Model never falls back to the shared cache it was not staged into.
+// modelName's files, resolving each referencing service's claim as the
+// controller does: a service with a modelCache block mounts the claim it
+// names, or the default when it names none (its "<isvc>-model-cache" only in
+// perService mode, else the shared cache); a service with no block mounts the
+// Model's spec.modelCache.claimName when the Model names one. The Model's own
+// claim counts with or without a service, and the shared cache counts when
+// there is neither a service nor a Model claim to consult, so a model that
+// demonstrably lives on per-service or override claims never costs a pod on
+// the shared claim, which a shared-mode service may hold under RWO. The
+// claims of services that do not reference the model stay untouched, so
+// clearing one model does not create a read-write pod on every running
+// service's volume or fail on their attach timeouts. all is every cache claim
+// in the namespace, in the order cachePVCandidates returns.
 func targetedClaims(
 	all []purgeTarget, svcs []inferencev1alpha1.InferenceService, modelName, modelClaim string,
 ) []purgeTarget {
@@ -144,20 +141,17 @@ func targetedClaims(
 			continue
 		}
 		consulted = true
-		// A service with a claimName override mounts that claim. Without one
-		// the operator gives it a per-service claim only in perService mode,
-		// which is the mode whose claim exists here; otherwise its pods mount
-		// the shared cache.
-		// A service with a claimName override mounts that claim; one with no
-		// block of its own mounts the Model's claim when the Model names one.
 		claim := userModelCacheClaimName(svc)
-		if claim == "" {
+		if svc.Spec.ModelCache == nil && svc.Spec.ModelRef == modelName {
 			claim = modelClaim
 		}
 		if claim != "" {
 			own[claim] = true
 			continue
 		}
+		// No claim of its own and none inherited: the operator gives it a
+		// per-service claim only in perService mode, which is the mode whose
+		// claim exists here; otherwise its pods mount the shared cache.
 		if perService := perServiceCacheClaimName(svc.Name); exists[perService] {
 			own[perService] = true
 			continue
