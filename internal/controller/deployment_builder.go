@@ -606,10 +606,9 @@ func (r *InferenceServiceReconciler) constructDeployment(
 	}
 	mirrorEnv, _ := runtimeHFMirrorEnv(backend, isvc, model, hfEndpoint)
 	container.Env = append(container.Env, mirrorEnv...)
-	// A pod that consumes a prefetched claim has no business on the Hub:
-	// the libraries behind vLLM, SGLang and friends honour these and fail
-	// fast on any path the operator does not model (#2136).
-	if r.prefetchSatisfied(isvc, model) {
+	// Env only: llama.cpp takes a file path and never calls the Hub, so
+	// there is no arg to mirror on the metal-agent side.
+	if isvc.Spec.Offline {
 		container.Env = append(container.Env,
 			corev1.EnvVar{Name: "HF_HUB_OFFLINE", Value: "1"},
 			corev1.EnvVar{Name: "TRANSFORMERS_OFFLINE", Value: "1"})

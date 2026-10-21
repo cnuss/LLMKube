@@ -850,6 +850,16 @@ type InferenceServiceSpec struct {
 	// +optional
 	SkipModelInit *bool `json:"skipModelInit,omitempty"`
 
+	// Offline keeps the serving runtime off the Hugging Face Hub: the pods
+	// get HF_HUB_OFFLINE=1 and TRANSFORMERS_OFFLINE=1, so a lookup the
+	// operator did not stage (a tokenizer in another repository, remote
+	// code) fails at once instead of downloading on the serving node. Pair
+	// it with modelCache.prefetch or a pvc:// source in air-gapped
+	// clusters. llama.cpp reads a file path and ignores both. An explicit
+	// spec.env entry with the same name wins.
+	// +optional
+	Offline bool `json:"offline,omitempty"`
+
 	// StageModel opts a runtime that does not stage models by default (generic) into
 	// Model-managed staging: the operator downloads the referenced Model into the model
 	// cache with the same init containers and read-only /models mount the built-in

@@ -144,13 +144,6 @@ func (r *InferenceServiceReconciler) prefetchGate(isvc *inferencev1alpha1.Infere
 	return g
 }
 
-// prefetchSatisfied reports whether the pods should be rendered to consume a
-// prefetched cache: the service asked, and the prefetch is current.
-func (r *InferenceServiceReconciler) prefetchSatisfied(isvc *inferencev1alpha1.InferenceService, model *inferencev1alpha1.Model) bool {
-	g := r.prefetchGate(isvc, model)
-	return g.applies && g.satisfied
-}
-
 // setModelPrefetchedCondition records the gate on the service. The condition
 // exists only while the field is set; it is removed, not flipped, when the
 // user drops the request.

@@ -3958,6 +3958,16 @@ spec:
                   type: string
                 description: NodeSelector for pod placement (e.g., specific node pools)
                 type: object
+              offline:
+                description: |-
+                  Offline keeps the serving runtime off the Hugging Face Hub: the pods
+                  get HF_HUB_OFFLINE=1 and TRANSFORMERS_OFFLINE=1, so a lookup the
+                  operator did not stage (a tokenizer in another repository, remote
+                  code) fails at once instead of downloading on the serving node. Pair
+                  it with modelCache.prefetch or a pvc:// source in air-gapped
+                  clusters. llama.cpp reads a file path and ignores both. An explicit
+                  spec.env entry with the same name wins.
+                type: boolean
               pagedSSDCacheDir:
                 description: |-
                   PagedSSDCacheDir sets the directory for the oMLX paged SSD cache.

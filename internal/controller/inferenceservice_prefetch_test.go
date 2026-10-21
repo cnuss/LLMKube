@@ -265,8 +265,7 @@ var _ = Describe("InferenceService modelCache.prefetch (#2136)", func() {
 		Expect(cond.Status).To(Equal(metav1.ConditionTrue))
 		Expect(cond.Reason).To(Equal(ReasonPrefetchComplete))
 		Expect(got.Status.SchedulingStatus).To(BeEmpty(), "the hold's diagnosis is cleared when the gate opens")
-		Expect(envValue(pod.Containers[0].Env, "HF_HUB_OFFLINE")).To(Equal("1"), "a prefetched pod has no business on the Hub")
-		Expect(envValue(pod.Containers[0].Env, "TRANSFORMERS_OFFLINE")).To(Equal("1"))
+		Expect(envValue(pod.Containers[0].Env, "HF_HUB_OFFLINE")).To(BeEmpty(), "prefetch alone does not take the runtime offline; spec.offline does")
 		Expect(findPrefetchStatus(model, "svc-cache").Files).To(Equal([]string{canonicalModelBasename(model)}), "the Job records what it wrote")
 		hash1 := dep.Annotations[AnnotationDesiredTemplateHash]
 		Expect(hash1).NotTo(BeEmpty())

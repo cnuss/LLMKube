@@ -294,9 +294,10 @@ With the field set:
   Job recorded on the entry are present (and hashes a single file against
   `spec.sha256` when one is pinned). If a file is missing the pod fails with
   `PrefetchedFilesMissing` (surfaced on the `ModelTransferHealthy`
-  condition) rather than downloading on the serving node. The pods also get
-  `HF_HUB_OFFLINE=1` and `TRANSFORMERS_OFFLINE=1`, so a runtime cannot reach
-  the Hub through a path the operator does not model.
+  condition) rather than downloading on the serving node. Add `spec.offline: true`
+  when the runtime must not reach the Hub for anything the Job did not
+  stage: the pods then get `HF_HUB_OFFLINE=1` and `TRANSFORMERS_OFFLINE=1`
+  and fail at once on such a lookup.
 - Use a `ReadWriteMany` (or `ReadOnlyMany`) claim when the serving pods run
   on other nodes than the Job. A `ReadWriteOnce` claim attaches to one node:
   the first staging works because the Job finishes before the pods attach,
