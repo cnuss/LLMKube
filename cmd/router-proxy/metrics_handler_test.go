@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"slices"
@@ -9,6 +10,7 @@ import (
 
 	"github.com/prometheus/common/expfmt"
 	"github.com/prometheus/common/model"
+	clientmetrics "k8s.io/client-go/tools/metrics"
 
 	prommetrics "github.com/defilantech/llmkube/internal/metrics"
 )
@@ -52,6 +54,10 @@ func TestMetricsHandlerServesLLMKubeCollectors(t *testing.T) {
 // this endpoint is a zero the alerts read as real: llmkube_watch_canary_up 0
 // fires LLMKubeControllerWatchCanaryDown for the router's namespace (#2294).
 func TestMetricsHandlerServesOnlyProxyFamilies(t *testing.T) {
+	// client-go's hook, as a real API-server call records it; the family has
+	// no series until then.
+	clientmetrics.RequestResult.Increment(context.Background(), "403", http.MethodGet, "kubernetes.default.svc")
+
 	rec := httptest.NewRecorder()
 	newMetricsHandler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
 
@@ -61,15 +67,17 @@ func TestMetricsHandlerServesOnlyProxyFamilies(t *testing.T) {
 		t.Fatalf("parse scrape: %v", err)
 	}
 
-	served := []string{"llmkube_router_", "llmkube_modelpool_", "llmkube_relay_", "go_", "process_"}
+	served := []string{"llmkube_router_", "llmkube_modelpool_", "llmkube_relay_", "rest_client_", "go_", "process_"}
 	for name := range families {
 		if !slices.ContainsFunc(served, func(p string) bool { return strings.HasPrefix(name, p) }) {
 			t.Errorf("metrics endpoint serves %s, which the router-proxy does not record", name)
 		}
 	}
-	// Unlabelled, so present from registration on: these pin that the relay's
-	// collectors and the runtime collectors are still served.
-	for _, name := range []string{"llmkube_relay_pin_mismatch_total", "go_goroutines", "process_cpu_seconds_total"} {
+	// The relay's and the runtime collectors are unlabelled, so present from
+	// registration on.
+	for _, name := range []string{
+		"llmkube_relay_pin_mismatch_total", "rest_client_requests_total", "go_goroutines", "process_cpu_seconds_total",
+	} {
 		if _, ok := families[name]; !ok {
 			t.Errorf("metrics endpoint does not serve %s", name)
 		}

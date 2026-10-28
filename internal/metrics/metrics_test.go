@@ -68,6 +68,42 @@ func TestMetricsRegistered(t *testing.T) {
 	}
 }
 
+// RouterRegistry is what the router-proxy serves, and the proxy sets none of
+// the controller's collectors, so one there is exported at zero (#2294).
+// Compared by descriptor: a labelled collector with no series is absent from
+// a scrape but not from Describe.
+func TestRouterRegistryHoldsNoControllerCollector(t *testing.T) {
+	served := describedNames(t, RouterRegistry)
+	shared := describedNames(t, ModelPoolResident)
+	for name := range describedNames(t, ControllerCollectors...) {
+		if served[name] && !shared[name] {
+			t.Errorf("RouterRegistry holds %s, which only the controller sets", name)
+		}
+	}
+}
+
+func describedNames(t *testing.T, collectors ...prometheus.Collector) map[string]bool {
+	t.Helper()
+
+	descs := make(chan *prometheus.Desc)
+	go func() {
+		defer close(descs)
+		for _, c := range collectors {
+			c.Describe(descs)
+		}
+	}()
+
+	names := map[string]bool{}
+	for desc := range descs {
+		m := descFQName.FindStringSubmatch(desc.String())
+		if m == nil {
+			t.Fatalf("no fqName in Desc %s", desc)
+		}
+		names[m[1]] = true
+	}
+	return names
+}
+
 func TestModelDownloadDuration(t *testing.T) {
 	m := getHistogramMetric(t, ModelDownloadDuration, []string{"dl-test", "default", "http"}, 5.5)
 

@@ -27,6 +27,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"slices"
 	"strings"
 	"syscall"
 	"time"
@@ -35,8 +36,11 @@ import (
 	"k8s.io/client-go/kubernetes"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	dto "github.com/prometheus/client_model/go"
 
 	inferencev1alpha1 "github.com/defilantech/llmkube/api/v1alpha1"
 	prommetrics "github.com/defilantech/llmkube/internal/metrics"
@@ -334,8 +338,9 @@ func routerNameFromEnv() string {
 	return os.Getenv("ROUTER_NAME")
 }
 
-// newMetricsHandler serves internal/metrics' RouterRegistry, NOT the
-// Prometheus default one, and NOT controller-runtime's.
+// newMetricsHandler serves internal/metrics' RouterRegistry plus
+// controller-runtime's rest_client_* families, NOT the Prometheus default
+// registry, and NOT the rest of controller-runtime's.
 //
 // promhttp.Handler() serves prometheus.DefaultGatherer, which holds none of the
 // llmkube collectors, so using it here returns HTTP 200 carrying Go runtime and
@@ -345,10 +350,24 @@ func routerNameFromEnv() string {
 //
 // controller-runtime's registry holds the controller's collectors, which the
 // proxy never sets; served here, llmkube_watch_canary_up 0 fires
-// LLMKubeControllerWatchCanaryDown for the router's namespace.
+// LLMKubeControllerWatchCanaryDown for the router's namespace. Its rest_client_*
+// families are the proxy's own: they count the API-server calls behind the
+// EndpointSlice watch and the ModelRouter reads.
 //
 // Extracted from main() purely so it can be asserted on; see the regression
 // tests alongside this file.
 func newMetricsHandler() http.Handler {
-	return promhttp.HandlerFor(prommetrics.RouterRegistry, promhttp.HandlerOpts{})
+	return promhttp.HandlerFor(prometheus.Gatherers{
+		prommetrics.RouterRegistry,
+		familiesWithPrefix(ctrlmetrics.Registry, "rest_client_"),
+	}, promhttp.HandlerOpts{})
+}
+
+func familiesWithPrefix(g prometheus.Gatherer, prefix string) prometheus.Gatherer {
+	return prometheus.GathererFunc(func() ([]*dto.MetricFamily, error) {
+		families, err := g.Gather()
+		return slices.DeleteFunc(families, func(mf *dto.MetricFamily) bool {
+			return !strings.HasPrefix(mf.GetName(), prefix)
+		}), err
+	})
 }

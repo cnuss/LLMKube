@@ -27,8 +27,6 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/prometheus/client_golang/prometheus"
-
 	"github.com/defilantech/llmkube/pkg/agent"
 )
 
@@ -112,25 +110,7 @@ var (
 func declaredNames(t *testing.T) map[string]bool {
 	t.Helper()
 
-	registered := append(slices.Clone(ControllerCollectors), RouterRegistry, agent.AgentRegistry)
-
-	descs := make(chan *prometheus.Desc)
-	go func() {
-		defer close(descs)
-		for _, collector := range registered {
-			collector.Describe(descs)
-		}
-	}()
-
-	names := map[string]bool{}
-	for desc := range descs {
-		m := descFQName.FindStringSubmatch(desc.String())
-		if m == nil {
-			t.Fatalf("no fqName in Desc %s", desc)
-		}
-		names[m[1]] = true
-	}
-	return names
+	return describedNames(t, append(slices.Clone(ControllerCollectors), RouterRegistry, agent.AgentRegistry)...)
 }
 
 // readPrometheusRuleTpl is the raw, un-rendered chart source both
