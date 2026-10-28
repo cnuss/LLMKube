@@ -29,7 +29,6 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
-	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 
 	prommetrics "github.com/defilantech/llmkube/internal/metrics"
 )
@@ -1257,7 +1256,7 @@ func TestRouterMetricsRegistered(t *testing.T) {
 	// exist and can be used without panic.
 	//
 	// The real verification is that the metrics appear on the
-	// /metrics endpoint in the controller-runtime metrics server.
+	// router-proxy's /metrics endpoint, which serves RouterRegistry.
 	// Here we assert the metrics can be incremented/observed without
 	// panic, which proves they are registered.
 	t.Run("RouterRequestsTotal", func(t *testing.T) {
@@ -1364,8 +1363,8 @@ func TestProxyMetricsNonZeroAfterSmokeRun(t *testing.T) {
 		t.Fatalf("status = %d, want 200", resp.StatusCode)
 	}
 
-	// Collect every metric from the controller-runtime metrics
-	// registry (where the metrics init() registers them) and scan
+	// Collect every metric from RouterRegistry (where the metrics
+	// init() registers them) and scan
 	// for the ones we expect to see populated. This avoids reaching
 	// into the prometheus library's internal Observer/Counter/Gauge
 	// types (which differ per metric kind) and instead uses the
@@ -1378,7 +1377,7 @@ func TestProxyMetricsNonZeroAfterSmokeRun(t *testing.T) {
 	var foundRequests, foundDuration, foundBudget, foundHealth bool
 	ch := make(chan prometheus.Metric)
 	go func() {
-		ctrlmetrics.Registry.(prometheus.Collector).Collect(ch)
+		prommetrics.RouterRegistry.Collect(ch)
 		close(ch)
 	}()
 	for m := range ch {
@@ -1489,11 +1488,11 @@ func budgetStreamPostPath(t *testing.T, mux http.Handler, path, body string) *ht
 	return resp
 }
 
-// registryHas reports whether the controller-runtime registry currently
+// registryHas reports whether RouterRegistry currently
 // holds a metric family whose descriptor contains name.
 func registryHas(name string) bool {
 	ch := make(chan prometheus.Metric, 256)
-	ctrlmetrics.Registry.(prometheus.Collector).Collect(ch)
+	prommetrics.RouterRegistry.Collect(ch)
 	close(ch)
 	for m := range ch {
 		if strings.Contains(m.Desc().String(), name) {

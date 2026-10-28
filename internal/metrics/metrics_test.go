@@ -42,18 +42,29 @@ func getHistogramMetric(t *testing.T, h *prometheus.HistogramVec, labels []strin
 }
 
 func TestMetricsRegistered(t *testing.T) {
-	if len(AllCollectors) == 0 {
-		t.Fatal("AllCollectors is empty")
-	}
-	for _, c := range AllCollectors {
-		err := ctrlmetrics.Registry.Register(c)
-		if err == nil {
-			t.Errorf("collector %T was not registered by init()", c)
-			continue
-		}
-		if _, ok := err.(prometheus.AlreadyRegisteredError); !ok {
-			t.Errorf("collector %T: unexpected error: %v", c, err)
-		}
+	for _, tc := range []struct {
+		name       string
+		collectors []prometheus.Collector
+		registry   prometheus.Registerer
+	}{
+		{"ControllerCollectors", ControllerCollectors, ctrlmetrics.Registry},
+		{"RouterCollectors", RouterCollectors, RouterRegistry},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if len(tc.collectors) == 0 {
+				t.Fatalf("%s is empty", tc.name)
+			}
+			for _, c := range tc.collectors {
+				err := tc.registry.Register(c)
+				if err == nil {
+					t.Errorf("collector %T was not registered by init()", c)
+					continue
+				}
+				if _, ok := err.(prometheus.AlreadyRegisteredError); !ok {
+					t.Errorf("collector %T: unexpected error: %v", c, err)
+				}
+			}
+		})
 	}
 }
 

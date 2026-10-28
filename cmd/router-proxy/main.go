@@ -35,11 +35,11 @@ import (
 	"k8s.io/client-go/kubernetes"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
 	inferencev1alpha1 "github.com/defilantech/llmkube/api/v1alpha1"
+	prommetrics "github.com/defilantech/llmkube/internal/metrics"
 	"github.com/defilantech/llmkube/internal/router"
 )
 
@@ -197,10 +197,10 @@ func main() {
 
 	// Serve Prometheus metrics on a separate listener. The router and ModelPool
 	// metrics (requests, residency, swaps, swap/hold duration, coalescing,
-	// held-request depth) are registered on the controller-runtime registry
-	// from internal/metrics; without this endpoint they are collected but never
-	// scrapeable. A separate port keeps metrics off the inference listener and
-	// lets a ServiceMonitor target it independently. Empty, "0" or "none"
+	// held-request depth) are registered on internal/metrics' RouterRegistry;
+	// without this endpoint they are collected but never scrapeable. A
+	// separate port keeps metrics off the inference listener and lets a
+	// ServiceMonitor target it independently. Empty, "0" or "none"
 	// disables the server; see metricsDisabled for why "0" is accepted.
 	var metricsSrv *http.Server
 	if addr := *metricsListen; !metricsDisabled(addr) {
@@ -334,19 +334,21 @@ func routerNameFromEnv() string {
 	return os.Getenv("ROUTER_NAME")
 }
 
-// newMetricsHandler serves controller-runtime's registry, NOT the Prometheus
-// default one.
+// newMetricsHandler serves internal/metrics' RouterRegistry, NOT the
+// Prometheus default one, and NOT controller-runtime's.
 //
-// Every llmkube collector, llmkube_router_* and llmkube_modelpool_* alike, is
-// registered into ctrlmetrics.Registry by internal/metrics' init().
-// promhttp.Handler() serves prometheus.DefaultGatherer, a different registry,
-// so using it here returns HTTP 200 carrying Go runtime and process metrics and
-// none of the series this endpoint exists for. That failure is silent: the
-// scrape succeeds, the PodMonitor reports a healthy target, and the dashboards
-// are simply empty.
+// promhttp.Handler() serves prometheus.DefaultGatherer, which holds none of the
+// llmkube collectors, so using it here returns HTTP 200 carrying Go runtime and
+// process metrics and none of the series this endpoint exists for. That failure
+// is silent: the scrape succeeds, the PodMonitor reports a healthy target, and
+// the dashboards are simply empty.
+//
+// controller-runtime's registry holds the controller's collectors, which the
+// proxy never sets; served here, llmkube_watch_canary_up 0 fires
+// LLMKubeControllerWatchCanaryDown for the router's namespace.
 //
 // Extracted from main() purely so it can be asserted on; see the regression
-// test alongside this file.
+// tests alongside this file.
 func newMetricsHandler() http.Handler {
-	return promhttp.HandlerFor(ctrlmetrics.Registry, promhttp.HandlerOpts{})
+	return promhttp.HandlerFor(prommetrics.RouterRegistry, promhttp.HandlerOpts{})
 }

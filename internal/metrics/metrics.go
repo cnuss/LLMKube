@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/collectors"
 	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 )
 
@@ -531,10 +532,11 @@ var (
 	)
 )
 
-// AllCollectors is every metric this operator registers. init() registers
-// these and the tests range over the same slice, so a metric cannot be added
-// to one list and silently missed in the other.
-var AllCollectors = []prometheus.Collector{
+// ControllerCollectors are the metrics the operator binaries record. init()
+// registers them in controller-runtime's registry, which the manager serves,
+// and the tests range over the same slice, so a metric cannot be added to one
+// list and silently missed in the other.
+var ControllerCollectors = []prometheus.Collector{
 	GPUQuotaUsedGPUCount,
 	GPUQuotaGPUCountLimit,
 	GPUQuotaAdmissionDenialsTotal,
@@ -549,6 +551,21 @@ var AllCollectors = []prometheus.Collector{
 	GPUQueueDepth,
 	ReconcileTotal,
 	ReconcileDuration,
+	ModelPoolResident,
+	ModelPoolReclaimsTotal,
+	ForemanTaskCompletedTotal,
+	ForemanTaskDurationSeconds,
+	ForemanTaskTurns,
+	ForemanWorkloadCompletedTotal,
+	ForemanArchiveFailuresTotal,
+	WatchCanaryLastObservedTimestamp,
+	WatchCanaryUp,
+	WatchCanaryWritesTotal,
+}
+
+// RouterCollectors are the metrics the router-proxy records. ModelPoolResident
+// is in both lists: the controller and the proxy each set it.
+var RouterCollectors = []prometheus.Collector{
 	RouterRequestsTotal,
 	RouterRequestDuration,
 	RouterFailClosedTotal,
@@ -569,24 +586,27 @@ var AllCollectors = []prometheus.Collector{
 	ModelPoolResident,
 	ModelPoolSwapsTotal,
 	ModelPoolSwapFailuresTotal,
-	ModelPoolReclaimsTotal,
 	ModelPoolSwapDuration,
 	ModelPoolHoldDuration,
 	ModelPoolCoalescedTotal,
 	ModelPoolBusySkipsTotal,
 	ModelPoolHeldRequests,
-	ForemanTaskCompletedTotal,
-	ForemanTaskDurationSeconds,
-	ForemanTaskTurns,
-	ForemanWorkloadCompletedTotal,
-	ForemanArchiveFailuresTotal,
-	WatchCanaryLastObservedTimestamp,
-	WatchCanaryUp,
-	WatchCanaryWritesTotal,
 }
 
+// RouterRegistry is the registry the router-proxy serves. It is not
+// controller-runtime's: importing this package registers ControllerCollectors
+// there, and the proxy runs none of the loops that set them, so serving it
+// would export their zeros. llmkube_watch_canary_up 0 fires
+// LLMKubeControllerWatchCanaryDown.
+var RouterRegistry = prometheus.NewRegistry()
+
 func init() {
-	ctrlmetrics.Registry.MustRegister(AllCollectors...)
+	ctrlmetrics.Registry.MustRegister(ControllerCollectors...)
+	RouterRegistry.MustRegister(RouterCollectors...)
+	RouterRegistry.MustRegister(
+		collectors.NewGoCollector(),
+		collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
+	)
 }
 
 // PublishModelPhase makes phase the only llmkube_model_status series for a

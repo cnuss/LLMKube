@@ -41,9 +41,9 @@ import (
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
-	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 
 	apiv1 "github.com/defilantech/llmkube/api/v1alpha1"
+	"github.com/defilantech/llmkube/internal/metrics"
 )
 
 var (
@@ -72,7 +72,7 @@ var (
 )
 
 func init() {
-	ctrlmetrics.Registry.MustRegister(requestsTotal, pinMismatchTotal)
+	metrics.RouterRegistry.MustRegister(requestsTotal, pinMismatchTotal)
 }
 
 // Config configures a Relay.

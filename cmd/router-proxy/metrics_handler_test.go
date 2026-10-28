@@ -3,8 +3,12 @@ package main
 import (
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"testing"
+
+	"github.com/prometheus/common/expfmt"
+	"github.com/prometheus/common/model"
 
 	prommetrics "github.com/defilantech/llmkube/internal/metrics"
 )
@@ -14,7 +18,7 @@ import (
 //
 // This is a regression test for a silent failure that shipped once already.
 // promhttp.Handler() serves prometheus.DefaultGatherer, while internal/metrics
-// registers every collector into controller-runtime's registry. Wiring the
+// registers the router's collectors into RouterRegistry. Wiring the
 // wrong one still returns HTTP 200, with roughly 38 families of Go runtime and
 // process metrics, so the scrape succeeds, the PodMonitor reports a healthy
 // target, and the dashboards are just empty. Nothing logs an error, which is
@@ -41,5 +45,33 @@ func TestMetricsHandlerServesLLMKubeCollectors(t *testing.T) {
 		t.Errorf("metrics endpoint does not expose llmkube_router_requests_total; "+
 			"it is serving the wrong registry. Got %d bytes beginning: %.200s",
 			len(body), body)
+	}
+}
+
+// The proxy runs none of the controller's loops, so a controller collector on
+// this endpoint is a zero the alerts read as real: llmkube_watch_canary_up 0
+// fires LLMKubeControllerWatchCanaryDown for the router's namespace (#2294).
+func TestMetricsHandlerServesOnlyProxyFamilies(t *testing.T) {
+	rec := httptest.NewRecorder()
+	newMetricsHandler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+
+	parser := expfmt.NewTextParser(model.UTF8Validation)
+	families, err := parser.TextToMetricFamilies(rec.Body)
+	if err != nil {
+		t.Fatalf("parse scrape: %v", err)
+	}
+
+	served := []string{"llmkube_router_", "llmkube_modelpool_", "llmkube_relay_", "go_", "process_"}
+	for name := range families {
+		if !slices.ContainsFunc(served, func(p string) bool { return strings.HasPrefix(name, p) }) {
+			t.Errorf("metrics endpoint serves %s, which the router-proxy does not record", name)
+		}
+	}
+	// Unlabelled, so present from registration on: these pin that the relay's
+	// collectors and the runtime collectors are still served.
+	for _, name := range []string{"llmkube_relay_pin_mismatch_total", "go_goroutines", "process_cpu_seconds_total"} {
+		if _, ok := families[name]; !ok {
+			t.Errorf("metrics endpoint does not serve %s", name)
+		}
 	}
 }

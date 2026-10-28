@@ -30,7 +30,6 @@ import (
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus/testutil"
-	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 
 	prommetrics "github.com/defilantech/llmkube/internal/metrics"
 	"github.com/defilantech/llmkube/internal/router/picker"
@@ -322,7 +321,7 @@ func TestSessionValueNeverExposed(t *testing.T) {
 	if strings.Contains(logs.String(), secret) {
 		t.Errorf("log output contains the session value:\n%s", logs.String())
 	}
-	families, err := ctrlmetrics.Registry.Gather()
+	families, err := prommetrics.RouterRegistry.Gather()
 	if err != nil {
 		t.Fatalf("gather: %v", err)
 	}

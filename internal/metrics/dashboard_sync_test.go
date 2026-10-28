@@ -106,12 +106,13 @@ var (
 )
 
 // declaredNames returns the fqName of every collector this repo registers.
-// AllCollectors is the controller's set; the Metal agent binary registers 19
-// more into its own registry, and *prometheus.Registry is itself a Collector.
+// ControllerCollectors is the controller's set; the router-proxy and the Metal
+// agent binary register theirs into their own registries, and
+// *prometheus.Registry is itself a Collector.
 func declaredNames(t *testing.T) map[string]bool {
 	t.Helper()
 
-	registered := append(slices.Clone(AllCollectors), agent.AgentRegistry)
+	registered := append(slices.Clone(ControllerCollectors), RouterRegistry, agent.AgentRegistry)
 
 	descs := make(chan *prometheus.Desc)
 	go func() {
