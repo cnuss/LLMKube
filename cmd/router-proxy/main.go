@@ -348,11 +348,10 @@ func routerNameFromEnv() string {
 // is silent: the scrape succeeds, the PodMonitor reports a healthy target, and
 // the dashboards are simply empty.
 //
-// controller-runtime's registry holds the controller's collectors, which the
-// proxy never sets; served here, llmkube_watch_canary_up 0 fires
-// LLMKubeControllerWatchCanaryDown for the router's namespace. Its rest_client_*
-// families are the proxy's own: they count the API-server calls behind the
-// EndpointSlice watch and the ModelRouter reads.
+// The rest of controller-runtime's registry is the manager's (certwatcher_*,
+// controller_runtime_*), which the proxy never sets. Its rest_client_* families
+// are the proxy's own: they count the API-server calls behind the EndpointSlice
+// watch and the ModelRouter reads.
 //
 // Extracted from main() purely so it can be asserted on; see the regression
 // tests alongside this file.

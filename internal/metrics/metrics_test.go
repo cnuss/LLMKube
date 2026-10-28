@@ -17,6 +17,7 @@ limitations under the License.
 package metrics
 
 import (
+	"slices"
 	"testing"
 	"time"
 
@@ -42,29 +43,29 @@ func getHistogramMetric(t *testing.T, h *prometheus.HistogramVec, labels []strin
 }
 
 func TestMetricsRegistered(t *testing.T) {
-	for _, tc := range []struct {
-		name       string
-		collectors []prometheus.Collector
-		registry   prometheus.Registerer
-	}{
-		{"ControllerCollectors", ControllerCollectors, ctrlmetrics.Registry},
-		{"RouterCollectors", RouterCollectors, RouterRegistry},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			if len(tc.collectors) == 0 {
-				t.Fatalf("%s is empty", tc.name)
-			}
-			for _, c := range tc.collectors {
-				err := tc.registry.Register(c)
-				if err == nil {
-					t.Errorf("collector %T was not registered by init()", c)
-					continue
-				}
-				if _, ok := err.(prometheus.AlreadyRegisteredError); !ok {
-					t.Errorf("collector %T: unexpected error: %v", c, err)
-				}
-			}
-		})
+	if len(RouterCollectors) == 0 {
+		t.Fatal("RouterCollectors is empty")
+	}
+	for _, c := range RouterCollectors {
+		err := RouterRegistry.Register(c)
+		if err == nil {
+			t.Errorf("collector %T was not registered by init()", c)
+			continue
+		}
+		if _, ok := err.(prometheus.AlreadyRegisteredError); !ok {
+			t.Errorf("collector %T: unexpected error: %v", c, err)
+		}
+	}
+}
+
+// Every binary that imports this package and serves controller-runtime's
+// registry would export what an import registered there (#2294). Each binary
+// registers its own list; cmd and cmd/foreman-operator test theirs.
+func TestImportRegistersNothingInControllerRuntime(t *testing.T) {
+	for _, c := range slices.Concat(ControllerCollectors, ForemanCollectors, RouterCollectors) {
+		if ctrlmetrics.Registry.Unregister(c) {
+			t.Errorf("collector %T was registered in controller-runtime's registry on import", c)
+		}
 	}
 }
 
@@ -75,9 +76,9 @@ func TestMetricsRegistered(t *testing.T) {
 func TestRouterRegistryHoldsNoControllerCollector(t *testing.T) {
 	served := describedNames(t, RouterRegistry)
 	shared := describedNames(t, ModelPoolResident)
-	for name := range describedNames(t, ControllerCollectors...) {
+	for name := range describedNames(t, slices.Concat(ControllerCollectors, ForemanCollectors)...) {
 		if served[name] && !shared[name] {
-			t.Errorf("RouterRegistry holds %s, which only the controller sets", name)
+			t.Errorf("RouterRegistry holds %s, which only an operator binary sets", name)
 		}
 	}
 }

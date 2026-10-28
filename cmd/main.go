@@ -50,6 +50,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
+	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 	"sigs.k8s.io/controller-runtime/pkg/metrics/filters"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 	"sigs.k8s.io/controller-runtime/pkg/webhook"
@@ -57,7 +58,7 @@ import (
 	federationv1alpha1 "github.com/defilantech/llmkube/api/federation/v1alpha1"
 	inferencev1alpha1 "github.com/defilantech/llmkube/api/v1alpha1"
 	"github.com/defilantech/llmkube/internal/controller"
-	_ "github.com/defilantech/llmkube/internal/metrics" // Register custom Prometheus metrics
+	llmkubemetrics "github.com/defilantech/llmkube/internal/metrics"
 	"github.com/defilantech/llmkube/internal/watchcanary"
 	// +kubebuilder:scaffold:imports
 )
@@ -77,6 +78,8 @@ func init() {
 	utilruntime.Must(inferencev1alpha1.AddToScheme(scheme))
 	utilruntime.Must(federationv1alpha1.AddToScheme(scheme))
 	// +kubebuilder:scaffold:scheme
+
+	ctrlmetrics.Registry.MustRegister(llmkubemetrics.ControllerCollectors...)
 }
 
 // maxPodLogLineBytes bounds one line read from a container log. llama.cpp's

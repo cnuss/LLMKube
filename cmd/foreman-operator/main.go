@@ -38,12 +38,14 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
+	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 	webhookserver "sigs.k8s.io/controller-runtime/pkg/webhook"
 
 	foremanv1alpha1 "github.com/defilantech/llmkube/api/foreman/v1alpha1"
 	foremancontroller "github.com/defilantech/llmkube/internal/foreman/controller"
 	foremanwebhook "github.com/defilantech/llmkube/internal/foreman/webhook"
+	llmkubemetrics "github.com/defilantech/llmkube/internal/metrics"
 	"github.com/defilantech/llmkube/pkg/foreman/audit"
 )
 
@@ -60,6 +62,8 @@ var (
 func init() {
 	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
 	utilruntime.Must(foremanv1alpha1.AddToScheme(scheme))
+
+	ctrlmetrics.Registry.MustRegister(llmkubemetrics.ForemanCollectors...)
 }
 
 func main() {

@@ -17,10 +17,16 @@ limitations under the License.
 package main
 
 import (
+	"errors"
+	"strings"
 	"testing"
 
+	"github.com/prometheus/client_golang/prometheus"
 	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
+
+	llmkubemetrics "github.com/defilantech/llmkube/internal/metrics"
 )
 
 // TestAgenticTaskReconciler_CarriesArchiveDir pins the one assignment that
@@ -69,5 +75,27 @@ func TestAgenticTaskReconciler_CarriesClientAndScheme(t *testing.T) {
 	}
 	if r.Scheme != s {
 		t.Errorf("Scheme = %v, want the scheme passed in (%v)", r.Scheme, s)
+	}
+}
+
+// The foreman-operator runs no watch canary, so llmkube_watch_canary_up on its
+// endpoint is a 0 that fires LLMKubeControllerWatchCanaryDown for its namespace
+// (#2294). The canary gauges are unlabelled: registered, they are served.
+func TestForemanOperatorServesOnlyItsCollectors(t *testing.T) {
+	for _, c := range llmkubemetrics.ForemanCollectors {
+		var already prometheus.AlreadyRegisteredError
+		if err := ctrlmetrics.Registry.Register(c); !errors.As(err, &already) {
+			t.Errorf("collector %T is not registered in controller-runtime's registry: %v", c, err)
+		}
+	}
+
+	families, err := ctrlmetrics.Registry.Gather()
+	if err != nil {
+		t.Fatalf("gather: %v", err)
+	}
+	for _, mf := range families {
+		if strings.HasPrefix(mf.GetName(), "llmkube_watch_canary_") {
+			t.Errorf("foreman-operator serves %s, which only the controller sets", mf.GetName())
+		}
 	}
 }

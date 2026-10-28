@@ -27,6 +27,11 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	fakeclientset "k8s.io/client-go/kubernetes/fake"
 	clientgotesting "k8s.io/client-go/testing"
+	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
+
+	"github.com/prometheus/client_golang/prometheus"
+
+	llmkubemetrics "github.com/defilantech/llmkube/internal/metrics"
 )
 
 // TestClientsetPodLogReader_ReadPodLogs covers the production PodLogReader
@@ -146,4 +151,16 @@ func firstLine(s string) string {
 		return s[:i]
 	}
 	return s
+}
+
+// Importing internal/metrics registers nothing in controller-runtime's
+// registry, so the controller's manager serves only what this package's
+// init() registers there.
+func TestControllerRegistersItsCollectors(t *testing.T) {
+	for _, c := range llmkubemetrics.ControllerCollectors {
+		var already prometheus.AlreadyRegisteredError
+		if err := ctrlmetrics.Registry.Register(c); !errors.As(err, &already) {
+			t.Errorf("collector %T is not registered in controller-runtime's registry: %v", c, err)
+		}
+	}
 }

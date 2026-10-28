@@ -27,6 +27,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/prometheus/client_golang/prometheus"
+
 	"github.com/defilantech/llmkube/pkg/agent"
 )
 
@@ -104,13 +106,14 @@ var (
 )
 
 // declaredNames returns the fqName of every collector this repo registers.
-// ControllerCollectors is the controller's set; the router-proxy and the Metal
-// agent binary register theirs into their own registries, and
-// *prometheus.Registry is itself a Collector.
+// ControllerCollectors and ForemanCollectors are the operator binaries' sets;
+// the router-proxy and the Metal agent binary register theirs into their own
+// registries, and *prometheus.Registry is itself a Collector.
 func declaredNames(t *testing.T) map[string]bool {
 	t.Helper()
 
-	return describedNames(t, append(slices.Clone(ControllerCollectors), RouterRegistry, agent.AgentRegistry)...)
+	return describedNames(t, slices.Concat(ControllerCollectors, ForemanCollectors,
+		[]prometheus.Collector{RouterRegistry, agent.AgentRegistry})...)
 }
 
 // readPrometheusRuleTpl is the raw, un-rendered chart source both
