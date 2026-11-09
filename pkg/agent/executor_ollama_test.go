@@ -22,21 +22,23 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 
 	"go.uber.org/zap"
 )
 
-// fakeOllama answers the routes OllamaExecutor.StartProcess calls and records
-// the model each request names.
-func fakeOllama(t *testing.T) (port int, models func() []string) {
+// fakeOllama answers the routes OllamaExecutor calls and records the model
+// each pull or load names. hailoList non-nil makes it hailo-ollama, serving
+// GET /hailo/v1/list with those tags and reporting size for them in /api/tags.
+func fakeOllama(t *testing.T, hailoList []string, size uint64) (port int, models func() []string) {
 	t.Helper()
 	var mu sync.Mutex
 	var seen []string
 	loaded := ""
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /", func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte("ok")) })
+	mux.HandleFunc("GET /{$}", func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte("ok")) })
 	record := func(w http.ResponseWriter, r *http.Request) {
 		var body struct{ Model string }
 		_ = json.NewDecoder(r.Body).Decode(&body)
@@ -53,6 +55,22 @@ func fakeOllama(t *testing.T) (port int, models func() []string) {
 		defer mu.Unlock()
 		_ = json.NewEncoder(w).Encode(ollamaPsResponse{Models: []ollamaPsModel{{Name: loaded, Model: loaded}}})
 	})
+	if hailoList != nil {
+		mux.HandleFunc("GET /hailo/v1/list", func(w http.ResponseWriter, _ *http.Request) {
+			_ = json.NewEncoder(w).Encode(hailoListResponse{Models: hailoList})
+		})
+		mux.HandleFunc("GET /api/tags", func(w http.ResponseWriter, _ *http.Request) {
+			var out ollamaTagsResponse
+			for _, m := range hailoList {
+				out.Models = append(out.Models, struct {
+					Name  string `json:"name"`
+					Model string `json:"model"`
+					Size  uint64 `json:"size"`
+				}{Name: m, Model: m, Size: size})
+			}
+			_ = json.NewEncoder(w).Encode(out)
+		})
+	}
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
 	return srv.Listener.Addr().(*net.TCPAddr).Port, func() []string {
@@ -62,37 +80,18 @@ func fakeOllama(t *testing.T) (port int, models func() []string) {
 	}
 }
 
-func TestOllamaExecutorRefusesNonLibraryTag(t *testing.T) {
-	port, models := fakeOllama(t)
-	e := NewOllamaExecutor(port, zap.NewNop().Sugar())
-	for _, tag := range []string{
-		"attacker.example.com/x/backdoor:latest",
-		"someone/model",
-		"qwen2.5:1.5b@sha256:abc",
-		"Qwen:1.5b",
-		":1.5b",
-	} {
-		if _, err := e.StartProcess(context.Background(), ExecutorConfig{ModelName: "m", OllamaModel: tag}); err == nil {
-			t.Errorf("tag %q started; want it refused before any request to the daemon", tag)
-		}
-	}
-	if got := models(); len(got) != 0 {
-		t.Errorf("daemon saw %v; want no pull or load for a refused tag", got)
-	}
-}
-
 func TestOllamaExecutorModelTag(t *testing.T) {
+	hailo := []string{"qwen2.5:1.5b", "llama3.2:1b"}
 	for name, tc := range map[string]struct {
 		cfg  ExecutorConfig
 		want string
 	}{
-		"annotation wins":       {ExecutorConfig{ModelName: "qwen25", OllamaModel: "qwen2.5:1.5b"}, "qwen2.5:1.5b"},
-		"mapped name":           {ExecutorConfig{ModelName: "llama-3.2-3b"}, "llama3.2:3b"},
-		"unmapped name as tag":  {ExecutorConfig{ModelName: "tinyllama"}, "tinyllama"},
-		"empty annotation maps": {ExecutorConfig{ModelName: "llama-3.2-3b", OllamaModel: ""}, "llama3.2:3b"},
+		"hailo source":         {ExecutorConfig{ModelName: "qwen25", ModelSource: "hailo://qwen2.5:1.5b"}, "qwen2.5:1.5b"},
+		"mapped name":          {ExecutorConfig{ModelName: "llama-3.2-3b", ModelSource: "https://x/m.gguf"}, "llama3.2:3b"},
+		"unmapped name as tag": {ExecutorConfig{ModelName: "tinyllama"}, "tinyllama"},
 	} {
 		t.Run(name, func(t *testing.T) {
-			port, models := fakeOllama(t)
+			port, models := fakeOllama(t, hailo, 0)
 			e := NewOllamaExecutor(port, zap.NewNop().Sugar())
 			p, err := e.StartProcess(context.Background(), tc.cfg)
 			if err != nil {
@@ -107,5 +106,50 @@ func TestOllamaExecutorModelTag(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestOllamaExecutorRefusesHailoSourceItCannotServe(t *testing.T) {
+	for name, tc := range map[string]struct {
+		hailoList []string
+		source    string
+		wantErr   string
+	}{
+		"stock ollama":    {hailoList: nil, source: "hailo://qwen2.5:1.5b", wantErr: "not hailo-ollama"},
+		"catch-all 200":   {hailoList: []string{}, source: "hailo://qwen2.5:1.5b", wantErr: "does not list"},
+		"tag hailo lacks": {hailoList: []string{"qwen3:1.7b"}, source: "hailo://qwen2.5:1.5b", wantErr: "does not list"},
+		"registry in the tag": {
+			hailoList: []string{"x"}, source: "hailo://evil.example.com/x:1", wantErr: "not a Hailo model tag",
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			port, models := fakeOllama(t, tc.hailoList, 0)
+			e := NewOllamaExecutor(port, zap.NewNop().Sugar())
+			_, err := e.StartProcess(context.Background(), ExecutorConfig{ModelName: "m", ModelSource: tc.source})
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("err = %v, want one containing %q", err, tc.wantErr)
+			}
+			if got := models(); len(got) != 0 {
+				t.Errorf("daemon saw %v; want no pull or load for a refused source", got)
+			}
+		})
+	}
+}
+
+func TestHailoModelSize(t *testing.T) {
+	port, models := fakeOllama(t, []string{"qwen2.5:1.5b"}, 2495056733)
+	e := NewOllamaExecutor(port, zap.NewNop().Sugar())
+	size, err := e.HailoModelSize(context.Background(), "qwen2.5:1.5b")
+	if err != nil || size != 2495056733 {
+		t.Fatalf("HailoModelSize = %d, %v; want the HEF size the daemon reports", size, err)
+	}
+	if got := models(); len(got) != 1 || got[0] != "qwen2.5:1.5b" {
+		t.Errorf("daemon saw %v; want one pull of the tag before it is sized", got)
+	}
+
+	stock, _ := fakeOllama(t, nil, 0)
+	stockExec := NewOllamaExecutor(stock, zap.NewNop().Sugar())
+	if _, err := stockExec.HailoModelSize(context.Background(), "qwen2.5:1.5b"); err == nil {
+		t.Error("sizing a hailo tag on stock Ollama: want an error, not the registry model's size")
 	}
 }

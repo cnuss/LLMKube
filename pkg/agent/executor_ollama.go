@@ -21,11 +21,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
-	"regexp"
 	"strings"
 	"time"
 
 	"go.uber.org/zap"
+
+	inferencev1alpha1 "github.com/defilantech/llmkube/api/v1alpha1"
 )
 
 // OllamaExecutor manages models via a shared Ollama daemon. Unlike MetalExecutor
@@ -89,15 +90,94 @@ type ollamaGenerateRequest struct {
 	KeepAlive *int   `json:"keep_alive,omitempty"`
 }
 
-// AnnotationOllamaModel on a Model names the Ollama tag the Ollama runtime
-// pulls and loads, for tags a Kubernetes name cannot spell (any "name:tag",
-// which every hailo-ollama model is). Experimental.
-const AnnotationOllamaModel = "llmkube.ai/ollama-model"
+// ollamaTag is the tag StartProcess pulls: the tag of a hailo:// source
+// (hailo is then true), else the Model name mapped through ollamaModelMap.
+func ollamaTag(config ExecutorConfig) (tag string, hailo bool, err error) {
+	if tag, ok, err := inferencev1alpha1.HailoSourceTag(config.ModelSource); ok {
+		return tag, true, err
+	}
+	return resolveOllamaModel(config.ModelName), false, nil
+}
 
-// ollamaTagPattern admits a library model, "name" or "name:tag". A "/" would
-// let the tag name another registry host or namespace, which the daemon would
-// pull from outside --allowed-download-hosts.
-var ollamaTagPattern = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]{0,127}(:[A-Za-z0-9._-]{1,128})?$`)
+// hailoListResponse is GET /hailo/v1/list, which only hailo-ollama serves.
+type hailoListResponse struct {
+	Models []string `json:"models"`
+}
+
+// requireHailoModel checks that the daemon is hailo-ollama and lists tag. A
+// stock Ollama daemon would pull a different artifact under the same tag from
+// its own registry, so a hailo:// source is refused there.
+func (e *OllamaExecutor) requireHailoModel(ctx context.Context, tag string) error {
+	url := fmt.Sprintf("http://127.0.0.1:%d/hailo/v1/list", e.port)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return err
+	}
+	resp, err := e.httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("list hailo models on port %d: %w", e.port, err)
+	}
+	defer drainAndClose(resp)
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("the daemon on port %d is not hailo-ollama (GET /hailo/v1/list returned %d); "+
+			"a hailo:// source is served only by hailo-ollama", e.port, resp.StatusCode)
+	}
+	var list hailoListResponse
+	if err := json.NewDecoder(resp.Body).Decode(&list); err != nil {
+		return fmt.Errorf("the daemon on port %d is not hailo-ollama (GET /hailo/v1/list is not a model list: %v); "+
+			"a hailo:// source is served only by hailo-ollama", e.port, err)
+	}
+	for _, m := range list.Models {
+		if m == tag {
+			return nil
+		}
+	}
+	return fmt.Errorf("hailo-ollama on port %d does not list %q; it lists %s",
+		e.port, tag, strings.Join(list.Models, ", "))
+}
+
+// ollamaTagsResponse is GET /api/tags.
+type ollamaTagsResponse struct {
+	Models []struct {
+		Name  string `json:"name"`
+		Model string `json:"model"`
+		Size  uint64 `json:"size"`
+	} `json:"models"`
+}
+
+// HailoModelSize pulls tag into hailo-ollama, a no-op when its cache already
+// has it, and returns the size the daemon reports, the HEF's size on disk.
+func (e *OllamaExecutor) HailoModelSize(ctx context.Context, tag string) (uint64, error) {
+	if err := e.requireHailoModel(ctx, tag); err != nil {
+		return 0, err
+	}
+	if err := e.pullModel(ctx, tag); err != nil {
+		return 0, fmt.Errorf("pull %s: %w", tag, err)
+	}
+	url := fmt.Sprintf("http://127.0.0.1:%d/api/tags", e.port)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return 0, err
+	}
+	resp, err := e.httpClient.Do(req)
+	if err != nil {
+		return 0, fmt.Errorf("list models on port %d: %w", e.port, err)
+	}
+	defer drainAndClose(resp)
+	if resp.StatusCode != http.StatusOK {
+		return 0, fmt.Errorf("GET /api/tags returned %d", resp.StatusCode)
+	}
+	var tags ollamaTagsResponse
+	if err := json.NewDecoder(resp.Body).Decode(&tags); err != nil {
+		return 0, fmt.Errorf("decode /api/tags: %w", err)
+	}
+	for _, m := range tags.Models {
+		if (m.Name == tag || m.Model == tag) && m.Size > 0 {
+			return m.Size, nil
+		}
+	}
+	return 0, fmt.Errorf("hailo-ollama reports no size for %q after pulling it", tag)
+}
 
 // resolveOllamaModel maps a LLMKube model name to an Ollama model tag.
 // If no mapping exists, the original name is returned as-is (allowing users
@@ -115,12 +195,9 @@ func resolveOllamaModel(modelName string) string {
 func (e *OllamaExecutor) StartProcess(
 	ctx context.Context, config ExecutorConfig,
 ) (*ManagedProcess, error) {
-	ollamaModel := config.OllamaModel
-	if ollamaModel == "" {
-		ollamaModel = resolveOllamaModel(config.ModelName)
-	} else if !ollamaTagPattern.MatchString(ollamaModel) {
-		return nil, fmt.Errorf("annotation %s %q is not an Ollama library tag (name or name:tag, no registry or namespace)",
-			AnnotationOllamaModel, ollamaModel)
+	ollamaModel, hailo, err := ollamaTag(config)
+	if err != nil {
+		return nil, err
 	}
 
 	e.logger.Infow("starting Ollama model",
@@ -130,6 +207,12 @@ func (e *OllamaExecutor) StartProcess(
 	if !e.isHealthy(ctx) {
 		return nil, fmt.Errorf(
 			"ollama is not running on port %d; start with: ollama serve", e.port)
+	}
+
+	if hailo {
+		if err := e.requireHailoModel(ctx, ollamaModel); err != nil {
+			return nil, err
+		}
 	}
 
 	// 2. Pull model (handles download if not already cached)

@@ -1003,7 +1003,6 @@ func buildExecutorConfig(
 		Namespace:              isvc.Namespace,
 		ModelSource:            model.Spec.Source,
 		ModelName:              model.Name,
-		OllamaModel:            model.Annotations[AnnotationOllamaModel],
 		ServedModelName:        servedModelName(isvc, model),
 		SourceSecret:           sourceSecretKeyFor(model.Namespace, model.Spec.SourceSecretRef),
 		SHA256:                 model.Spec.SHA256,
@@ -1086,6 +1085,16 @@ func (a *MetalAgent) resolveRuntime(isvc *inferencev1alpha1.InferenceService) st
 		return a.config.Runtime
 	}
 	return runtimeLlamaServer
+}
+
+// checkHailoRuntime refuses a hailo:// Model on any runtime but ollama, whose
+// executor drives hailo-ollama; the llama.cpp path would try to download it.
+func checkHailoRuntime(model *inferencev1alpha1.Model, runtime string) error {
+	if inferencev1alpha1.IsHailoSource(model.Spec.Source) && runtime != runtimeOllama {
+		return fmt.Errorf("model %s has a hailo:// source, which only the ollama runtime (hailo-ollama) serves; "+
+			"the resolved runtime is %q", model.Name, runtime)
+	}
+	return nil
 }
 
 // validateRuntimeFormat returns an error if the model's format is incompatible
@@ -1430,6 +1439,9 @@ func (a *MetalAgent) reconcileProcess(ctx context.Context, isvc *inferencev1alph
 		return err
 	}
 
+	if err := checkHailoRuntime(model, runtime); err != nil {
+		return err
+	}
 	if err := a.validateRuntimeFormat(model, runtime); err != nil {
 		return err
 	}
@@ -2663,6 +2675,20 @@ func (a *MetalAgent) estimateModelMemory(
 	}), nil
 }
 
+// hailoSizeProbe sizes a hailo:// source through the ollama runtime's
+// hailo-ollama, which reports a HEF's size only once it is pulled.
+func (a *MetalAgent) hailoSizeProbe(ctx context.Context, model *inferencev1alpha1.Model) (uint64, error) {
+	tag, _, err := inferencev1alpha1.HailoSourceTag(model.Spec.Source)
+	if err != nil {
+		return 0, err
+	}
+	exec, ok := a.executors[runtimeOllama].(*OllamaExecutor)
+	if !ok {
+		return 0, fmt.Errorf("no ollama runtime registered to size %s", model.Spec.Source)
+	}
+	return exec.HailoModelSize(ctx, tag)
+}
+
 // probeRemoteModelSize sizes an http(s) source with a HEAD for its
 // Content-Length, or an s3:// source with a signed HEAD through the same
 // executor the download uses, since it needs the credential-bearing client.
@@ -2675,6 +2701,9 @@ func (a *MetalAgent) probeRemoteModelSize(
 		probeClient := safehttp.NewClient(a.downloadAllow, 0, downloadHostsFlag)
 		defer probeClient.CloseIdleConnections()
 		size, err = remoteModelSize(ctx, probeClient, model.Spec.Source)
+		return size, true, err
+	case inferencev1alpha1.IsHailoSource(model.Spec.Source):
+		size, err = a.hailoSizeProbe(ctx, model)
 		return size, true, err
 	case isS3Source(model.Spec.Source):
 		size, err = a.s3SizeProbe(ctx, model)

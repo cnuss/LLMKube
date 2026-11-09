@@ -141,23 +141,27 @@ Hailo's [hailo-ollama](https://github.com/hailo-ai/hailo_model_zoo_genai)
 serves an Ollama-compatible API on port 8000. Start it on `127.0.0.1:8000`
 (`OLLAMA_HOST=127.0.0.1:8000`) and run the agent with `--ollama-port 8000`.
 
-Every hailo-ollama tag has the form `name:tag`, which a Kubernetes name cannot
-spell, and hailo-ollama has no implicit `:latest`. Name the tag with the
-experimental `llmkube.ai/ollama-model` annotation. Only library tags (`name`
-or `name:tag`) are accepted: a `/`, which would name another registry or
-namespace, is refused before anything reaches the daemon. `spec.source` is
-only used for the memory estimate; hailo-ollama manages its own model storage.
+Name the model with a `hailo://` source: a tag in Hailo's GenAI model zoo,
+such as `hailo://qwen2.5:1.5b`. hailo-ollama maps the tag to a HEF compiled for
+the Hailo-10H through the manifests it installs, and pulls it from Hailo's
+model host (`dev-public.hailo.ai`) into its own cache, so neither the
+controller nor the agent downloads anything. The source needs
+`accelerator: metal` and `runtime: ollama`; the controller marks the Model
+Failed otherwise. Only `name` or `name:tag` is accepted: a `/`, which could
+name another registry, is refused.
+
+Before it pulls, the agent checks that the daemon on `--ollama-port` is
+hailo-ollama (it serves `GET /hailo/v1/list`) and that it lists the tag, so a
+host running stock Ollama refuses the service instead of pulling a different
+model under the same name.
 
 ```yaml
 apiVersion: inference.llmkube.dev/v1alpha1
 kind: Model
 metadata:
   name: qwen25-15b
-  annotations:
-    llmkube.ai/ollama-model: "qwen2.5:1.5b"
 spec:
-  source: https://huggingface.co/Qwen/Qwen2.5-1.5B-Instruct-GGUF/resolve/main/qwen2.5-1.5b-instruct-q4_k_m.gguf
-  format: gguf
+  source: hailo://qwen2.5:1.5b
   hardware:
     accelerator: metal
 ---
@@ -171,9 +175,6 @@ spec:
   replicas: 1
 ```
 
-Like any Model change, editing the annotation does not restart a running
-service; change the InferenceService (or restart the agent) to pick it up.
-
 `GET /hailo/v1/list` on the host lists the tags the installed hailo-ollama
 knows.
 
@@ -185,9 +186,10 @@ Known limits, from hailo-ollama's server code:
 - Requests need `Content-Type: application/json`.
 - hailo-ollama keeps one model loaded and reloads on every switch, so run one
   `InferenceService` per HAT.
-- The memory budget measures the Pi's RAM and the GGUF in `spec.source`, not
-  the HAT's 8 GB or the HEF the engine loads. To test the HAT's limit, use the
-  simulator's `HAILO_SIM_DEVICE_MEMORY`.
+- The memory estimate is the HEF's size as hailo-ollama reports it, so the
+  agent pulls the HEF (2.3 GiB for `qwen2.5:1.5b`) before admitting the
+  service. The budget it is checked against is the Pi's RAM, not the HAT's
+  8 GB. To test the HAT's limit, use the simulator's `HAILO_SIM_DEVICE_MEMORY`.
 
 ## Testing without a HAT
 
