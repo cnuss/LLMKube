@@ -17,7 +17,6 @@ limitations under the License.
 package agent
 
 import (
-	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -87,35 +86,6 @@ func TestLinuxMemoryProviderMissingAvailable(t *testing.T) {
 	}
 }
 
-func TestHostCapacityFromProc(t *testing.T) {
-	files := map[string]string{
-		"/proc/meminfo":           piMeminfo,
-		"/proc/device-tree/model": "Raspberry Pi 5 Model B Rev 1.0\x00",
-		"/proc/cpuinfo":           "processor\t: 0\nmodel name\t: Cortex-A76\n",
-	}
-	read := func(p string) ([]byte, error) {
-		if v, ok := files[p]; ok {
-			return []byte(v), nil
-		}
-		return nil, errors.New("no such file")
-	}
-
-	got := hostCapacityFromProc(read)
-	if got.MemoryBytes != 8245328*1024 || got.Chip != "Raspberry Pi 5 Model B Rev 1.0" {
-		t.Errorf("capacity = %+v, want MemTotal and the device-tree model without its NUL", got)
-	}
-
-	delete(files, "/proc/device-tree/model")
-	if got := hostCapacityFromProc(read).Chip; got != "Cortex-A76" {
-		t.Errorf("chip without device tree = %q, want the cpuinfo model name", got)
-	}
-
-	noProc := func(string) ([]byte, error) { return nil, errors.New("no proc") }
-	if got := hostCapacityFromProc(noProc); got != (HostCapacity{}) {
-		t.Errorf("capacity without /proc = %+v, want empty rather than a guess", got)
-	}
-}
-
 func TestLinuxMemoryProviderCgroupLimit(t *testing.T) {
 	const gib = 1 << 30
 	root := writeProcFixture(t, map[string]string{
@@ -143,5 +113,58 @@ func TestLinuxMemoryProviderCgroupLimit(t *testing.T) {
 	}
 	if got, _ := p.TotalMemory(); got != 67108864*1024 {
 		t.Errorf("total = %d with a 128 GiB limit; want MemTotal", got)
+	}
+}
+
+func TestLinuxMemoryProviderLimitAndRoomAreSeparateMinimums(t *testing.T) {
+	const gib = 1 << 30
+	root := writeProcFixture(t, map[string]string{
+		"proc/meminfo":     "MemTotal: 67108864 kB\nMemAvailable: 60000000 kB\n",
+		"proc/self/cgroup": "0::/parent/agent\n",
+		// The parent is the larger limit but has the least room left.
+		"cg/parent/memory.max":           "17179869184\n",
+		"cg/parent/memory.current":       "16106127360\n",
+		"cg/parent/agent/memory.max":     "4294967296\n",
+		"cg/parent/agent/memory.current": "536870912\n",
+	})
+	p := &LinuxMemoryProvider{ProcRoot: filepath.Join(root, "proc"), CgroupRoot: filepath.Join(root, "cg")}
+	if got, err := p.TotalMemory(); err != nil || got != 4*gib {
+		t.Errorf("total = %d, %v; want the agent cgroup's 4 GiB limit, the smallest memory.max", got, err)
+	}
+	if got, err := p.AvailableMemory(); err != nil || got != 1*gib {
+		t.Errorf("available = %d, %v; want the parent's 1 GiB of room, the least room left", got, err)
+	}
+
+	host := p.HostWide()
+	if got, _ := host.TotalMemory(); got != 67108864*1024 {
+		t.Errorf("host-wide total = %d; want MemTotal, for a daemon outside the agent's cgroup", got)
+	}
+	if got, _ := host.AvailableMemory(); got != 60000000*1024 {
+		t.Errorf("host-wide available = %d; want MemAvailable", got)
+	}
+}
+
+func TestLinuxMemoryProviderUnreadableProc(t *testing.T) {
+	p := &LinuxMemoryProvider{ProcRoot: filepath.Join(t.TempDir(), "missing"), CgroupRoot: t.TempDir()}
+	if _, err := p.TotalMemory(); err == nil {
+		t.Error("TotalMemory with no meminfo: want an error")
+	}
+	if _, err := p.AvailableMemory(); err == nil {
+		t.Error("AvailableMemory with no meminfo: want an error, not zero (zero reads as Critical)")
+	}
+	if _, err := p.WiredMemory(); err == nil {
+		t.Error("WiredMemory with no meminfo: want an error")
+	}
+}
+
+func TestHostWideProviderKeepsOtherProviders(t *testing.T) {
+	other := &DarwinMemoryProvider{}
+	if got := hostWideProvider(other); got != MemoryProvider(other) {
+		t.Errorf("hostWideProvider(%T) = %T; want the provider unchanged", other, got)
+	}
+	lp := &LinuxMemoryProvider{ProcRoot: "/p", CgroupRoot: "/c"}
+	hw, ok := hostWideProvider(lp).(*LinuxMemoryProvider)
+	if !ok || !hw.IgnoreCgroup || hw.ProcRoot != "/p" || hw.CgroupRoot != "/c" || hw == lp {
+		t.Errorf("hostWideProvider(linux) = %+v; want a new host-wide provider on the same roots", hw)
 	}
 }

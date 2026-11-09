@@ -106,6 +106,9 @@ type MetalAgentConfig struct {
 	// "tensorfold". A CR that sets spec.runtime overrides it (see
 	// resolveRuntime).
 	Runtime string
+	// Accelerator is the Model spec.hardware.accelerator this agent serves:
+	// "metal" (the default when empty) or "npu".
+	Accelerator string
 	// OMLXBin is the path to the omlx binary. Only used when Runtime is "omlx".
 	OMLXBin string
 	// OMLXPort is the port the shared oMLX daemon listens on (default 8000).
@@ -659,15 +662,9 @@ func NewMetalAgent(config MetalAgentConfig) *MetalAgent {
 	}
 }
 
-// Start begins watching for InferenceService resources and managing processes
-// buildExecutors populates a.executors with one ProcessExecutor per runtime
-// whose binary path is configured, so each InferenceService can pick its own
-// backend via spec.runtime (#525). The llama.cpp executor is always created
-// because it is the default fallback, and it is registered under BOTH
-// runtimeLlamaServer ("llama-server", the historical key and --runtime
-// default) and runtimeLlamaCPP ("llamacpp", the CRD/controller canonical
-// value) so CRs authored with either runtime name resolve to it (#784).
-func (a *MetalAgent) buildExecutors() {
+// buildLlamaCPPExecutor registers the llama.cpp executor under both of its
+// runtime names.
+func (a *MetalAgent) buildLlamaCPPExecutor() {
 	metalExec := NewMetalExecutor(
 		a.config.LlamaServerBin,
 		a.config.ModelStorePath,
@@ -684,6 +681,21 @@ func (a *MetalAgent) buildExecutors() {
 	metalExec.SetEngineEnvPassthrough(a.config.EngineEnvPassthrough)
 	a.executors[runtimeLlamaServer] = metalExec
 	a.executors[runtimeLlamaCPP] = metalExec
+}
+
+// Start begins watching for InferenceService resources and managing processes
+// buildExecutors populates a.executors with one ProcessExecutor per runtime
+// whose binary path is configured, so each InferenceService can pick its own
+// backend via spec.runtime (#525). The llama.cpp executor is created whenever
+// llama-server was found (the agent exits without it unless --runtime selects
+// another engine), and it is registered under BOTH
+// runtimeLlamaServer ("llama-server", the historical key and --runtime
+// default) and runtimeLlamaCPP ("llamacpp", the CRD/controller canonical
+// value) so CRs authored with either runtime name resolve to it (#784).
+func (a *MetalAgent) buildExecutors() {
+	if a.config.LlamaServerBin != "" {
+		a.buildLlamaCPPExecutor()
+	}
 
 	if a.config.OMLXBin != "" {
 		port := a.config.OMLXPort
@@ -1732,6 +1744,9 @@ func (a *MetalAgent) stopManagedProcess(ctx context.Context, process *ManagedPro
 		// (e.g. a process spawned before the multi-runtime refactor).
 		exec = a.executors[runtimeLlamaServer]
 	}
+	if exec == nil && !process.Adopted {
+		return fmt.Errorf("no executor registered for runtime %q to stop PID %d", process.Runtime, process.PID)
+	}
 
 	if ollama, ok := exec.(*OllamaExecutor); ok && process.ModelID != "" {
 		if err := ollama.UnloadModel(ctx, process.ModelID); err != nil {
@@ -1892,6 +1907,7 @@ func (a *MetalAgent) markStopped(ctx context.Context, isvc *inferencev1alpha1.In
 // the agent's config.
 func (a *MetalAgent) newWatcher() *InferenceServiceWatcher {
 	w := NewInferenceServiceWatcher(a.config.K8sClient, a.config.Namespace, a.logger.With("subsystem", "watcher"))
+	w.SetAccelerator(a.config.Accelerator)
 	if a.config.MaxWatchFailures > 0 {
 		w.SetMaxConsecutiveFailures(a.config.MaxWatchFailures)
 	}
@@ -2288,6 +2304,15 @@ func (a *MetalAgent) HealthCheck() map[string]bool {
 	return health
 }
 
+// admissionMemoryProvider measures memory for isvc's engine: host-wide for
+// Ollama, a daemon outside the agent's cgroup, else the agent's provider.
+func (a *MetalAgent) admissionMemoryProvider(isvc *inferencev1alpha1.InferenceService) MemoryProvider {
+	if a.resolveRuntime(isvc) == runtimeOllama {
+		return hostWideProvider(a.memoryProvider)
+	}
+	return a.memoryProvider
+}
+
 // checkMemoryAdmission runs the pre-flight memory check for an
 // InferenceService: estimate the model's memory need, resolve the budget, and
 // reject the service when it does not fit. A check that cannot be completed
@@ -2312,7 +2337,8 @@ func (a *MetalAgent) checkMemoryAdmission(
 
 	// This Mac's budget, the limit its owner set with --memory-fraction. Every
 	// admitted model shares it, and a Model budget may not exceed it.
-	total, totalErr := a.memoryProvider.TotalMemory()
+	provider := a.admissionMemoryProvider(isvc)
+	total, totalErr := provider.TotalMemory()
 	if totalErr != nil {
 		return a.failMemoryCheck(ctx, isvc,
 			fmt.Sprintf("memory budget check failed: failed to get total memory: %v", totalErr))
@@ -2333,7 +2359,7 @@ func (a *MetalAgent) checkMemoryAdmission(
 		budget = CheckMemoryBudgetAbsolute(resolved.Bytes, estimate)
 	default: // BudgetModeFraction
 		var budgetErr error
-		budget, budgetErr = CheckMemoryBudget(a.memoryProvider, estimate, resolved.Fraction)
+		budget, budgetErr = CheckMemoryBudget(provider, estimate, resolved.Fraction)
 		if budgetErr != nil {
 			return a.failMemoryCheck(ctx, isvc, fmt.Sprintf("memory budget check failed: %v", budgetErr))
 		}

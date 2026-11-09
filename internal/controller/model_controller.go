@@ -63,16 +63,14 @@ const (
 	// (pkg/agent) and the operator share one importable home; aliases keep
 	// the unqualified references in this package working. See
 	// api/v1alpha1/constants.go for the canonical definitions.
-	PhaseReady       = inferencev1alpha1.PhaseReady
-	PhaseFailed      = inferencev1alpha1.PhaseFailed
-	PhaseCached      = inferencev1alpha1.PhaseCached
-	PhaseDownloading = inferencev1alpha1.PhaseDownloading
-	PhaseCreating    = inferencev1alpha1.PhaseCreating
-	PhaseStopped     = inferencev1alpha1.PhaseStopped
-	PhaseSuspended   = inferencev1alpha1.PhaseSuspended
-	// acceleratorMetal is the Model.Spec.Hardware.Accelerator value for the
-	// host metal-agent path.
-	acceleratorMetal      = "metal"
+	PhaseReady            = inferencev1alpha1.PhaseReady
+	PhaseFailed           = inferencev1alpha1.PhaseFailed
+	PhaseCached           = inferencev1alpha1.PhaseCached
+	PhaseDownloading      = inferencev1alpha1.PhaseDownloading
+	PhaseCreating         = inferencev1alpha1.PhaseCreating
+	PhaseStopped          = inferencev1alpha1.PhaseStopped
+	PhaseSuspended        = inferencev1alpha1.PhaseSuspended
+	acceleratorMetal      = inferencev1alpha1.AcceleratorMetal
 	acceleratorCUDA       = "cuda"
 	acceleratorROCm       = "rocm"
 	acceleratorCPU        = "cpu"
@@ -820,9 +818,10 @@ func (r *ModelReconciler) reconcileOCISource(ctx context.Context, model *inferen
 // IDs where the runtime resolves and stores the model on its own. A non-empty
 // cacheKey lets InferenceService.spec build the canonical
 // /models/<cacheKey>/<basename> path that the init container will populate.
-// isMetalModel reports whether the model targets the host metal-agent path.
+// isMetalModel reports whether the model targets the host agent path
+// (accelerator metal or npu).
 func isMetalModel(model *inferencev1alpha1.Model) bool {
-	return model.Spec.Hardware != nil && model.Spec.Hardware.Accelerator == acceleratorMetal
+	return model.Spec.Hardware != nil && inferencev1alpha1.IsHostAgentAccelerator(model.Spec.Hardware.Accelerator)
 }
 
 // reconcileBySourceType handles the model sources that need no controller-side
@@ -1282,7 +1281,7 @@ func (r *ModelReconciler) checkAcceleratorAvailability(ctx context.Context, mode
 	switch accel {
 	case "", acceleratorCPU:
 		return true
-	case acceleratorMetal:
+	case inferencev1alpha1.AcceleratorMetal, inferencev1alpha1.AcceleratorNPU:
 		return true
 	}
 

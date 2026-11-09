@@ -21,6 +21,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"regexp"
 	"strings"
 	"time"
 
@@ -93,6 +94,11 @@ type ollamaGenerateRequest struct {
 // which every hailo-ollama model is). Experimental.
 const AnnotationOllamaModel = "llmkube.ai/ollama-model"
 
+// ollamaTagPattern admits a library model, "name" or "name:tag". A "/" would
+// let the tag name another registry host or namespace, which the daemon would
+// pull from outside --allowed-download-hosts.
+var ollamaTagPattern = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]{0,127}(:[A-Za-z0-9._-]{1,128})?$`)
+
 // resolveOllamaModel maps a LLMKube model name to an Ollama model tag.
 // If no mapping exists, the original name is returned as-is (allowing users
 // to specify arbitrary Ollama model names in their Model CRD).
@@ -112,6 +118,9 @@ func (e *OllamaExecutor) StartProcess(
 	ollamaModel := config.OllamaModel
 	if ollamaModel == "" {
 		ollamaModel = resolveOllamaModel(config.ModelName)
+	} else if !ollamaTagPattern.MatchString(ollamaModel) {
+		return nil, fmt.Errorf("annotation %s %q is not an Ollama library tag (name or name:tag, no registry or namespace)",
+			AnnotationOllamaModel, ollamaModel)
 	}
 
 	e.logger.Infow("starting Ollama model",

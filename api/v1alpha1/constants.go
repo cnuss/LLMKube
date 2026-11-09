@@ -133,10 +133,25 @@ const (
 	DefaultAgentHeartbeatTimeout = 3 * time.Minute
 )
 
+// Model spec.hardware.accelerator values served by the host agent
+// (cmd/metal-agent) rather than in-cluster pods. An agent serves one of them:
+// "metal" on an Apple Silicon Mac, "npu" on a Linux host with a neural
+// accelerator such as a Hailo-10H.
+const (
+	AcceleratorMetal = "metal"
+	AcceleratorNPU   = "npu"
+)
+
+// IsHostAgentAccelerator reports whether accelerator is served by the host
+// agent.
+func IsHostAgentAccelerator(accelerator string) bool {
+	return accelerator == AcceleratorMetal || accelerator == AcceleratorNPU
+}
+
 // InferenceService spec.runtime values served only by the metal-agent on
 // Apple Silicon hosts (#525). They have no in-cluster backend, so the
 // controller refuses them on a Model whose hardware.accelerator is not
-// "metal". Shared here because the metal-agent keys its executors on the same
+// served by the host agent (IsHostAgentAccelerator). Shared here because the metal-agent keys its executors on the same
 // strings and pkg/agent cannot import internal/controller. The values are
 // CRD-visible (spec.runtime enum) and must not change without an API bump.
 const (

@@ -66,6 +66,7 @@ type AgentConfig struct {
 	LlamaServerBin            string
 	LlamaServerPort           int
 	Runtime                   string
+	Accelerator               string
 	OMLXBin                   string
 	OMLXPort                  int
 	OllamaPort                int
@@ -273,9 +274,8 @@ func resolveLlamaServerBin(override string) (string, error) {
 		}
 	}
 	return "", fmt.Errorf(
-		"llama-server not found in default paths (%v); "+
-			"install with: brew install llama.cpp, or pass --llama-server=/path/to/binary",
-		defaultLlamaServerPaths)
+		"llama-server not found in default paths (%v); install with: %s, or pass --llama-server=/path/to/binary",
+		defaultLlamaServerPaths, llamaServerInstallHint(hostGOOS))
 }
 
 // defaultOMLXPaths is the list of paths to search for the omlx binary.
@@ -351,8 +351,7 @@ var defaultTensorFoldPaths = []string{
 var userHomeDir = os.UserHomeDir
 
 // resolveModelStorePath returns the absolute model store path: the default
-// "~/Library/Application Support/llmkube/models" under the agent user's home
-// when the flag is empty (beside the --state-dir default, out of the
+// models directory under agent.DefaultDataDir when the flag is empty (beside the --state-dir default, out of the
 // world-writable /tmp the store used to default to), otherwise the flag with
 // a leading "~" or "~/" resolved against home exactly as --state-dir does
 // (launchd passes "~" literally). "~user" is not expanded. Anything still
@@ -364,7 +363,7 @@ func resolveModelStorePath(flagValue string) (string, error) {
 		if err != nil {
 			return "", err
 		}
-		return filepath.Join(home, "Library", "Application Support", "llmkube", "models"), nil
+		return filepath.Join(agent.DefaultDataDir(home), "models"), nil
 	}
 	path := flagValue
 	if path == "~" || strings.HasPrefix(path, "~/") {
@@ -503,48 +502,85 @@ func resolveOMLXBin(override string) (string, error) {
 }
 
 // resolveDefaultLlamaServerBin sets cfg.LlamaServerBin. A missing binary is
-// fatal only when --runtime selects llama.cpp; with another runtime the
-// agent starts and only services that select llama.cpp fail.
-func resolveDefaultLlamaServerBin(cfg *AgentConfig, override string, logger *zap.SugaredLogger) {
+// an error only when --runtime selects llama.cpp; with another runtime the
+// agent starts without the llama.cpp executor and only services that select
+// llama.cpp are refused.
+func resolveDefaultLlamaServerBin(cfg *AgentConfig, override string, logger *zap.SugaredLogger) error {
 	resolvedBin, err := resolveLlamaServerBin(override)
 	switch {
 	case err == nil:
 		cfg.LlamaServerBin = resolvedBin
+		return nil
 	case inferencev1alpha1.IsMetalOnlyRuntime(cfg.Runtime):
-		logger.Warnw("llama-server binary not found; services that select llama.cpp will fail to start",
+		logger.Warnw("llama-server binary not found; services that select llama.cpp will be refused",
 			"runtime", cfg.Runtime, "error", err)
+		return nil
 	default:
-		logger.Errorw("llama-server binary not found",
-			"searchPaths", defaultLlamaServerPaths,
-			"installHint", "brew install llama.cpp",
-			"error", err,
-		)
-		os.Exit(1)
+		return err
 	}
 }
 
-// checkHostPlatform exits unless the host has Metal or is Linux, where
-// support is experimental and engines bring their own accelerator.
-func checkHostPlatform(logger *zap.SugaredLogger) platform.Capabilities {
-	logger.Infow("checking Metal support")
-	caps := platform.DetectCapabilities()
-	switch {
-	case caps.Metal:
+// llamaServerInstallHint names how to install llama-server on goos.
+func llamaServerInstallHint(goos string) string {
+	if goos == "darwin" {
+		return "brew install llama.cpp"
+	}
+	return "your distribution's llama.cpp package or a source build of llama-server"
+}
+
+// defaultAccelerator is the --accelerator default for goos.
+func defaultAccelerator(goos string) string {
+	if goos == "linux" {
+		return inferencev1alpha1.AcceleratorNPU
+	}
+	return inferencev1alpha1.AcceleratorMetal
+}
+
+// hailoDeviceGlob matches the device nodes the Hailo PCIe driver creates.
+const hailoDeviceGlob = "/dev/hailo*"
+
+// Host probes checkHostPlatform uses, replaced in tests.
+var (
+	detectCapabilities = platform.DetectCapabilities
+	hostGOOS           = goruntime.GOOS
+	globDevices        = filepath.Glob
+)
+
+// checkHostPlatform resolves --accelerator and returns an error unless the
+// host can serve it: "metal" needs Metal, "npu" needs Linux (experimental).
+// An "npu" host with no Hailo device node only warns, since other NPUs are not
+// detected.
+func checkHostPlatform(logger *zap.SugaredLogger, accelerator string) (string, platform.Capabilities, error) {
+	if accelerator == "" {
+		accelerator = defaultAccelerator(hostGOOS)
+	}
+	logger.Infow("checking host platform", "accelerator", accelerator)
+	caps := detectCapabilities()
+	switch accelerator {
+	case inferencev1alpha1.AcceleratorMetal:
+		if !caps.Metal {
+			return accelerator, caps, errors.New(
+				"metal support not detected: --accelerator=metal needs macOS with Apple Silicon; on Linux use --accelerator=npu")
+		}
 		logger.Infow("Metal support detected",
 			"gpuName", caps.GPUName,
 			"gpuCores", caps.GPUCores,
 			"metalVersion", caps.MetalVersion,
 		)
-	case goruntime.GOOS == "linux":
-		logger.Warnw("Metal not available; Linux host support is experimental",
-			"os", caps.OS, "arch", caps.Arch)
+	case inferencev1alpha1.AcceleratorNPU:
+		if hostGOOS != "linux" {
+			return accelerator, caps, fmt.Errorf("--accelerator=npu is only supported on Linux, not %s", hostGOOS)
+		}
+		logger.Warnw("serving accelerator npu; Linux host support is experimental", "arch", caps.Arch)
+		if devices, _ := globDevices(hailoDeviceGlob); len(devices) > 0 {
+			logger.Infow("Hailo device detected", "devices", devices)
+		} else {
+			logger.Warnw("no NPU device found; the engine must bring its own accelerator", "checked", hailoDeviceGlob)
+		}
 	default:
-		logger.Errorw("Metal support not detected",
-			"requirement", "macOS with Apple Silicon (M1/M2/M3/M4), or Linux (experimental)",
-		)
-		os.Exit(1)
+		return accelerator, caps, fmt.Errorf("invalid --accelerator %q: want metal or npu", accelerator)
 	}
-	return caps
+	return accelerator, caps, nil
 }
 
 // resolveOptionalRuntimeBins resolves the binaries of the non-default
@@ -624,7 +660,8 @@ func main() {
 	flag.StringVar(&cfg.Namespace, "namespace", "default", "Kubernetes namespace to watch")
 	flag.StringVar(&cfg.ModelStorePath, "model-store", "",
 		"Path to store downloaded models: absolute, or starting with ~/. "+
-			"Default: ~/Library/Application Support/llmkube/models. The agent refuses a store it does "+
+			"Default: ~/Library/Application Support/llmkube/models on macOS, "+
+			"$XDG_DATA_HOME/llmkube/models (~/.local/share/llmkube/models) elsewhere. The agent refuses a store it does "+
 			"not own, that other users can write, or that sits under a directory other users can write.")
 	flag.StringVar(&llamaServerFlag, "llama-server", "", "Path to llama-server binary (auto-detected if not set)")
 	flag.IntVar(&cfg.LlamaServerPort, "llama-server-port", 0,
@@ -633,6 +670,9 @@ func main() {
 			"clients (e.g. an OpenAI-compatible tool pointed at localhost).")
 	flag.StringVar(&cfg.Runtime, "runtime", "llama-server",
 		"Inference runtime: llama-server, omlx, ollama, vllm-swift, mlx-server, or tensorfold")
+	flag.StringVar(&cfg.Accelerator, "accelerator", "",
+		"Model spec.hardware.accelerator this agent serves: metal or npu (experimental). "+
+			"Default: metal on macOS, npu on Linux.")
 	flag.StringVar(&cfg.OMLXBin, "omlx-bin", "", "Path to omlx binary (auto-detected if not set)")
 	flag.IntVar(&cfg.OMLXPort, "omlx-port", 8000, "Port for oMLX server")
 	flag.IntVar(&cfg.OllamaPort, "ollama-port", 11434, "Port for Ollama server")
@@ -648,7 +688,8 @@ func main() {
 		"TLS port of the authenticated ingress that in-cluster relays use to reach engines (engines listen on "+
 			"127.0.0.1 only). Open this port, not engine ports, in the macOS firewall.")
 	flag.StringVar(&cfg.StateDir, "state-dir", "",
-		"Directory for agent state (the ingress TLS key). Default: ~/Library/Application Support/llmkube/metal-agent.")
+		"Directory for agent state (the ingress TLS key). Default: ~/Library/Application Support/llmkube/metal-agent "+
+			"on macOS, $XDG_DATA_HOME/llmkube/metal-agent (~/.local/share/llmkube/metal-agent) elsewhere.")
 	flag.BoolVar(&cfg.LegacyDirectEndpoints, "legacy-direct-endpoints", false,
 		"DEPRECATED, removed in a future release: bind engines on all interfaces without authentication and "+
 			"register them directly, as before the ingress. Only for a controller that predates relay support.")
@@ -819,7 +860,10 @@ func main() {
 	// when their binary path flag is set or when the agent's --runtime flag
 	// selects them, so the agent can host multiple runtimes concurrently
 	// (#525).
-	resolveDefaultLlamaServerBin(cfg, llamaServerFlag, logger)
+	if err := resolveDefaultLlamaServerBin(cfg, llamaServerFlag, logger); err != nil {
+		logger.Errorw("llama-server binary not found", "error", err)
+		os.Exit(1)
+	}
 	resolveOptionalRuntimeBins(cfg, logger)
 
 	hostIP := cfg.HostIP
@@ -842,7 +886,12 @@ func main() {
 		"engineEnvPassthrough", engineEnvPassthrough,
 	)
 
-	caps := checkHostPlatform(logger)
+	accelerator, caps, err := checkHostPlatform(logger, cfg.Accelerator)
+	if err != nil {
+		logger.Errorw("host cannot serve the accelerator", "error", err)
+		os.Exit(1)
+	}
+	cfg.Accelerator = accelerator
 
 	maxDownloadBytes, err := resolveMaxDownloadBytes(cfg.MaxDownloadSize, agent.NewHostMemoryProvider().TotalMemory)
 	if err != nil {
@@ -926,6 +975,7 @@ func main() {
 		LlamaServerBin:            cfg.LlamaServerBin,
 		LlamaServerPort:           cfg.LlamaServerPort,
 		Runtime:                   cfg.Runtime,
+		Accelerator:               cfg.Accelerator,
 		Version:                   Version,
 		OMLXBin:                   cfg.OMLXBin,
 		OMLXPort:                  cfg.OMLXPort,

@@ -197,7 +197,7 @@ func TestPrepareIngress_RelayFailsOnBadIdentity(t *testing.T) {
 
 func TestDefaultStateDir(t *testing.T) {
 	got, err := resolveStateDir("", "/Users/x")
-	if err != nil || got != "/Users/x/Library/Application Support/llmkube/metal-agent" {
+	if err != nil || got != filepath.Join(DefaultDataDir("/Users/x"), "metal-agent") {
 		t.Errorf("resolveStateDir default = %q, %v", got, err)
 	}
 	if got, _ := resolveStateDir("/var/state", "/Users/x"); got != "/var/state" {
@@ -484,5 +484,18 @@ func TestListenIngressBindFailureAdvertisesNothing(t *testing.T) {
 	}
 	if got := a.metalNodeReport(context.Background()); got.IngressSPKI != "" || got.IngressPort != 0 {
 		t.Errorf("report after a failed bind = pin %q port %d, want neither", got.IngressSPKI, got.IngressPort)
+	}
+}
+
+func TestDefaultDataDirPerOS(t *testing.T) {
+	for _, tc := range []struct{ goos, xdg, want string }{
+		{"darwin", "/xdg", "/home/u/Library/Application Support/llmkube"},
+		{"linux", "", "/home/u/.local/share/llmkube"},
+		{"linux", "/xdg", "/xdg/llmkube"},
+		{"linux", "relative", "/home/u/.local/share/llmkube"},
+	} {
+		if got := defaultDataDir(tc.goos, "/home/u", tc.xdg); got != tc.want {
+			t.Errorf("defaultDataDir(%s, XDG_DATA_HOME=%q) = %q, want %q", tc.goos, tc.xdg, got, tc.want)
+		}
 	}
 }

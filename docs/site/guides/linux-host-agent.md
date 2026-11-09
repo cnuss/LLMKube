@@ -7,8 +7,19 @@ description: Run the metal-agent on a Linux arm64 host such as a Raspberry Pi 5,
 
 The [Metal agent](/docs/guides/macos-metal) also starts on Linux. It joins the cluster
 the same way a Mac does (a `MetalNode`, a Lease heartbeat, the dial-back check
-and the in-cluster relay), and runs a daemon engine on the host. On Linux it
-logs `Metal not available; Linux host support is experimental` at startup.
+and the in-cluster relay), and runs a daemon engine on the host.
+
+On Linux the agent serves Models with `hardware.accelerator: npu`
+(experimental), where a Mac serves `metal`. Each agent only takes Models with
+its own accelerator, so Macs and Linux hosts in the same namespace never pick
+up each other's services. `--accelerator` overrides the default (`metal` on
+macOS, `npu` on Linux). With `npu`, the agent logs a warning at startup when
+it finds no Hailo device node (`/dev/hailo*`).
+
+Routing a service to a host by its accelerator value is interim. The proposal
+in [#2481](https://github.com/defilantech/LLMKube/issues/2481) keeps
+`accelerator` as the hardware a model needs and makes placement on a
+`MetalNode` explicit, so this may change.
 
 Tracking issue: [#2481](https://github.com/defilantech/LLMKube/issues/2481).
 
@@ -22,6 +33,7 @@ Tracking issue: [#2481](https://github.com/defilantech/LLMKube/issues/2481).
 | `llmkube metal join` | Refuses Linux. Join [by hand](#join-the-host) |
 | Release artifacts | None for Linux. [Build the agent](#build-the-agent) from source |
 | Raspberry Pi OS kernel (16K pages) | Untested. The tests above ran on a 4K-page kernel |
+| `llmkube deploy --accelerator npu` | Not supported yet. Write the Model and InferenceService by hand |
 
 ## Build the agent
 
@@ -81,10 +93,13 @@ llmkube-metal-agent \
   --metal-node pi5 \
   --renew-service-account-token \
   --runtime ollama \
-  --ollama-port 11434 \
-  --model-store /var/lib/llmkube/models \
-  --state-dir /var/lib/llmkube/agent
+  --ollama-port 11434
 ```
+
+The model store and state directory default to
+`$XDG_DATA_HOME/llmkube/models` and `$XDG_DATA_HOME/llmkube/metal-agent`
+(`~/.local/share/llmkube/...` when `XDG_DATA_HOME` is unset); `--model-store`
+and `--state-dir` override them.
 
 Then wait for the `MetalNode` to report `Reachable=True`:
 
@@ -94,18 +109,24 @@ kubectl get metalnode pi5 -n default
 
 ## Memory
 
-On Linux the agent reads `/proc/meminfo`, capped by the tightest cgroup v2
-`memory.max` from its own cgroup up to the root. A systemd `MemoryMax=` or a
-container `--memory` limit therefore sizes the memory budget, the download cap
-and the `MetalNode` capacity. Engines the agent starts inherit that cgroup; a
-daemon it only talks to, such as Ollama or hailo-ollama, does not, and its
-memory is not counted against the limit.
+On Linux the agent reads `/proc/meminfo`, capped by the cgroup v2 limits from
+its own cgroup up to the root: total memory is the smallest `memory.max` on
+that path, and available memory the least room left under any of them. A
+systemd `MemoryMax=` or a container `--memory` limit therefore sizes the
+download cap, the `MetalNode` capacity and the budget for engines the agent
+starts, which inherit its cgroup.
+
+Ollama and hailo-ollama are daemons the agent only talks to and run outside
+its cgroup, so `runtime: ollama` services are admitted against the host's
+`MemTotal` and `MemAvailable`, whatever the agent's own limit.
+
+For a fit decision that does not depend on the machine, as in tests, set
+`spec.hardware.memoryBudget` on the Model. It may not exceed the host budget.
 
 ## Ollama on CPU
 
-Run Ollama on the host, listening on `127.0.0.1`, and use `runtime: ollama`.
-The Model still has to set `accelerator: metal` for the agent to pick it up.
-The Ollama tag is the Model's name, mapped through the agent's built-in table
+Run Ollama on the host, listening on `127.0.0.1`, and use `runtime: ollama`
+with `accelerator: npu`, the value a Linux agent serves. The Ollama tag is the Model's name, mapped through the agent's built-in table
 for a few known names, and the agent always pulls it from the registry, so a
 tag that exists only locally fails.
 
@@ -118,7 +139,7 @@ spec:
   source: https://huggingface.co/TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF/resolve/main/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf
   format: gguf
   hardware:
-    accelerator: metal
+    accelerator: npu
 ---
 apiVersion: inference.llmkube.dev/v1alpha1
 kind: InferenceService
@@ -141,7 +162,9 @@ serves an Ollama-compatible API on port 8000. Start it on `127.0.0.1:8000`
 
 Every hailo-ollama tag has the form `name:tag`, which a Kubernetes name cannot
 spell, and hailo-ollama has no implicit `:latest`. Name the tag with the
-experimental `llmkube.ai/ollama-model` annotation:
+experimental `llmkube.ai/ollama-model` annotation. Only library tags (`name`
+or `name:tag`) are accepted: a `/`, which would name another registry or
+namespace, is refused before anything reaches the daemon.
 
 ```yaml
 apiVersion: inference.llmkube.dev/v1alpha1
@@ -154,8 +177,11 @@ spec:
   source: https://huggingface.co/Qwen/Qwen2.5-1.5B-Instruct-GGUF/resolve/main/qwen2.5-1.5b-instruct-q4_k_m.gguf
   format: gguf
   hardware:
-    accelerator: metal
+    accelerator: npu
 ```
+
+Like any Model change, editing the annotation does not restart a running
+service; change the InferenceService (or restart the agent) to pick it up.
 
 `GET /hailo/v1/list` on the host lists the tags the installed hailo-ollama
 knows.
@@ -169,7 +195,8 @@ Known limits, from hailo-ollama's server code:
 - hailo-ollama keeps one model loaded and reloads on every switch, so run one
   `InferenceService` per HAT.
 - The memory budget measures the Pi's RAM and the GGUF in `spec.source`, not
-  the HAT's 8 GB or the HEF the engine loads.
+  the HAT's 8 GB or the HEF the engine loads. To test the HAT's limit, use the
+  simulator's `HAILO_SIM_DEVICE_MEMORY`.
 
 ## Testing without a HAT
 

@@ -21,69 +21,115 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 )
 
-// NewHostMemoryProvider returns the MemoryProvider for the OS the agent runs
-// on: /proc on Linux, sysctl and vm_stat otherwise.
-func NewHostMemoryProvider() MemoryProvider {
-	if runtime.GOOS == "linux" {
-		return &LinuxMemoryProvider{}
-	}
-	return &DarwinMemoryProvider{}
-}
-
 // LinuxMemoryProvider implements MemoryProvider from /proc, capped by the
-// cgroup v2 memory limit of the agent's own cgroup and its ancestors. Engines
-// the agent starts inherit that cgroup; a separately managed daemon (Ollama)
-// does not.
+// cgroup v2 memory limits on the path from the agent's own cgroup to the
+// root. Engines the agent starts inherit that cgroup; a daemon it only talks
+// to (Ollama) does not, and is measured with HostWide.
 type LinuxMemoryProvider struct {
 	// ProcRoot is the procfs mount; empty means /proc.
 	ProcRoot string
 	// CgroupRoot is the cgroup v2 mount; empty means /sys/fs/cgroup.
 	CgroupRoot string
+	// IgnoreCgroup reports host memory only.
+	IgnoreCgroup bool
+
+	dirsOnce sync.Once
+	dirs     []string
 }
 
-// cgroupLimit is the tightest memory.max on the path from the agent's cgroup
-// to the root, and the room left under it (limit minus usage, with inactive
-// file cache counted as reclaimable). ok is false when no limit is set or
-// cgroup v2 is not mounted.
-func (p *LinuxMemoryProvider) cgroupLimit() (limit, room uint64, ok bool) {
-	root := p.CgroupRoot
-	if root == "" {
-		root = "/sys/fs/cgroup"
+// HostWide returns a provider for the same host that ignores the agent's
+// cgroup limits, for engines that run outside the agent's cgroup.
+func (p *LinuxMemoryProvider) HostWide() *LinuxMemoryProvider {
+	return &LinuxMemoryProvider{ProcRoot: p.ProcRoot, CgroupRoot: p.CgroupRoot, IgnoreCgroup: true}
+}
+
+// hostWideProvider is p measured host-wide when p is a LinuxMemoryProvider,
+// else p.
+func hostWideProvider(p MemoryProvider) MemoryProvider {
+	if lp, ok := p.(*LinuxMemoryProvider); ok {
+		return lp.HostWide()
 	}
-	rel := "/"
-	if data, err := os.ReadFile(p.procPath("self", "cgroup")); err == nil {
-		for _, line := range strings.Split(string(data), "\n") {
-			if path, found := strings.CutPrefix(line, "0::"); found {
-				rel = path
+	return p
+}
+
+// cgroupDirs is the agent's cgroup directory and its ancestors up to the
+// mount, read once from /proc/self/cgroup.
+func (p *LinuxMemoryProvider) cgroupDirs() []string {
+	p.dirsOnce.Do(func() {
+		if p.IgnoreCgroup {
+			return
+		}
+		root := p.CgroupRoot
+		if root == "" {
+			root = "/sys/fs/cgroup"
+		}
+		root = filepath.Clean(root)
+		rel := "/"
+		if data, err := os.ReadFile(p.procPath("self", "cgroup")); err == nil {
+			for _, line := range strings.Split(string(data), "\n") {
+				if path, found := strings.CutPrefix(line, "0::"); found {
+					rel = path
+					break
+				}
+			}
+		}
+		for dir := filepath.Join(root, rel); strings.HasPrefix(dir, root); dir = filepath.Dir(dir) {
+			p.dirs = append(p.dirs, dir)
+			if dir == root {
 				break
 			}
 		}
-	}
-	for dir := filepath.Join(root, rel); ; dir = filepath.Dir(dir) {
-		if l, r, set := readCgroupMemory(dir); set && (!ok || r < room) {
-			limit, room, ok = l, r, true
-		}
-		if dir == root || !strings.HasPrefix(dir, root) {
-			return limit, room, ok
-		}
-	}
+	})
+	return p.dirs
 }
 
-// readCgroupMemory reads one cgroup's memory.max, memory.current and
-// memory.stat inactive_file. set is false for "max" or a missing file.
-func readCgroupMemory(dir string) (limit, room uint64, set bool) {
+// cgroupLimit is the smallest memory.max on the agent's cgroup path. ok is
+// false when no limit is set or cgroup v2 is not mounted.
+func (p *LinuxMemoryProvider) cgroupLimit() (limit uint64, ok bool) {
+	for _, dir := range p.cgroupDirs() {
+		if l, set := readCgroupMax(dir); set && (!ok || l < limit) {
+			limit, ok = l, true
+		}
+	}
+	return limit, ok
+}
+
+// cgroupRoom is the smallest room left under a memory.max on the agent's
+// cgroup path: limit minus usage, inactive file cache counted as
+// reclaimable. It is taken separately from cgroupLimit, since the cgroup
+// with the least room need not be the one with the smallest limit.
+func (p *LinuxMemoryProvider) cgroupRoom() (room uint64, ok bool) {
+	for _, dir := range p.cgroupDirs() {
+		if r, set := readCgroupRoom(dir); set && (!ok || r < room) {
+			room, ok = r, true
+		}
+	}
+	return room, ok
+}
+
+// readCgroupMax reads one cgroup's memory.max. set is false for "max" or a
+// missing file.
+func readCgroupMax(dir string) (limit uint64, set bool) {
 	raw, err := os.ReadFile(filepath.Join(dir, "memory.max"))
 	if err != nil {
-		return 0, 0, false
+		return 0, false
 	}
 	limit, err = strconv.ParseUint(strings.TrimSpace(string(raw)), 10, 64)
-	if err != nil {
-		return 0, 0, false
+	return limit, err == nil
+}
+
+// readCgroupRoom reads one cgroup's memory.max, memory.current and
+// memory.stat inactive_file. set is false when memory.max is "max" or
+// missing.
+func readCgroupRoom(dir string) (room uint64, set bool) {
+	limit, set := readCgroupMax(dir)
+	if !set {
+		return 0, false
 	}
 	var used uint64
 	if raw, err := os.ReadFile(filepath.Join(dir, "memory.current")); err == nil {
@@ -100,9 +146,9 @@ func readCgroupMemory(dir string) (limit, room uint64, set bool) {
 		}
 	}
 	if used >= limit {
-		return limit, 0, true
+		return 0, true
 	}
-	return limit, limit - used, true
+	return limit - used, true
 }
 
 func (p *LinuxMemoryProvider) procPath(elem ...string) string {
@@ -132,7 +178,7 @@ func (p *LinuxMemoryProvider) TotalMemory() (uint64, error) {
 	if err != nil {
 		return 0, err
 	}
-	if limit, _, ok := p.cgroupLimit(); ok && limit < total {
+	if limit, ok := p.cgroupLimit(); ok && limit < total {
 		return limit, nil
 	}
 	return total, nil
@@ -146,7 +192,7 @@ func (p *LinuxMemoryProvider) AvailableMemory() (uint64, error) {
 	if err != nil {
 		return 0, err
 	}
-	if _, room, ok := p.cgroupLimit(); ok && room < avail {
+	if room, ok := p.cgroupRoom(); ok && room < avail {
 		return room, nil
 	}
 	return avail, nil

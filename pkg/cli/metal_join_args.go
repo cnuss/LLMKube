@@ -47,6 +47,7 @@ const (
 // exits at once, and launchd restarts it every 30 seconds.
 // TestMetalAgentFlagsMatchTheAgent keeps the table in step with cmd/metal-agent.
 var metalAgentFlags = map[string]agentFlagKind{
+	"accelerator":                        agentFlagString,
 	"allow-model-memory-budget-override": agentFlagBool,
 	"allow-unlabeled-source-secrets":     agentFlagBool,
 	"allow-unsafe-extra-args":            agentFlagBool,

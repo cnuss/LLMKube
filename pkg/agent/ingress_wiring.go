@@ -74,8 +74,8 @@ func (c MetalAgentConfig) validateIngress() error {
 	return nil
 }
 
-// resolveStateDir returns the absolute state directory: the macOS default
-// under home when stateDir is empty, otherwise stateDir with a leading "~" or
+// resolveStateDir returns the absolute state directory: DefaultDataDir's
+// metal-agent directory when stateDir is empty, otherwise stateDir with a leading "~" or
 // "~/" resolved against home (launchd does not expand it) and a relative path
 // made absolute against the working directory. "~user" is not expanded.
 func resolveStateDir(stateDir, home string) (string, error) {
@@ -83,7 +83,7 @@ func resolveStateDir(stateDir, home string) (string, error) {
 		if home == "" {
 			return "", errors.New("--state-dir is not set and the home directory is unknown")
 		}
-		return filepath.Join(home, "Library", "Application Support", "llmkube", "metal-agent"), nil
+		return filepath.Join(DefaultDataDir(home), "metal-agent"), nil
 	}
 	if stateDir == "~" || strings.HasPrefix(stateDir, "~/") {
 		if home == "" {

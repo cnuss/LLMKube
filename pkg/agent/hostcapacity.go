@@ -17,7 +17,6 @@ limitations under the License.
 package agent
 
 import (
-	"math"
 	"strconv"
 	"strings"
 
@@ -34,22 +33,6 @@ type HostCapacity struct {
 	Chip         string
 	GPUCores     int32
 	MetalVersion string
-}
-
-// hostCapacityFromSysctl reads unified memory (hw.memsize) and the chip name
-// (machdep.cpu.brand_string). A value that cannot be read or parsed is left
-// empty rather than guessed.
-func hostCapacityFromSysctl(sysctl func(name string) (string, error)) HostCapacity {
-	var c HostCapacity
-	if out, err := sysctl("hw.memsize"); err == nil {
-		if n, err := strconv.ParseInt(strings.TrimSpace(out), 10, 64); err == nil && n > 0 {
-			c.MemoryBytes = n
-		}
-	}
-	if out, err := sysctl("machdep.cpu.brand_string"); err == nil {
-		c.Chip = printablePrefix(strings.TrimSpace(out), maxChipBytes)
-	}
-	return c
 }
 
 // printablePrefix drops every character the controller would reject
@@ -76,35 +59,4 @@ func MetalVersionString(v int) string {
 		return ""
 	}
 	return "Metal " + strconv.Itoa(v)
-}
-
-// hostCapacityFromProc reads memory (MemTotal) and a chip name: the
-// device-tree model when the board has one (Raspberry Pi and other ARM
-// boards), else the first cpuinfo "model name" or "Model" line.
-func hostCapacityFromProc(readFile func(path string) ([]byte, error)) HostCapacity {
-	var c HostCapacity
-	if data, err := readFile("/proc/meminfo"); err == nil {
-		if n, ok := parseProcKB(string(data))["MemTotal"]; ok && n > 0 && n <= math.MaxInt64 {
-			c.MemoryBytes = int64(n)
-		}
-	}
-	if data, err := readFile("/proc/device-tree/model"); err == nil {
-		c.Chip = printablePrefix(strings.TrimSpace(strings.TrimRight(string(data), "\x00")), maxChipBytes)
-	}
-	if c.Chip != "" {
-		return c
-	}
-	if data, err := readFile("/proc/cpuinfo"); err == nil {
-		for _, line := range strings.Split(string(data), "\n") {
-			key, val, ok := strings.Cut(line, ":")
-			if !ok {
-				continue
-			}
-			if k := strings.TrimSpace(key); k == "model name" || k == "Model" {
-				c.Chip = printablePrefix(strings.TrimSpace(val), maxChipBytes)
-				break
-			}
-		}
-	}
-	return c
 }

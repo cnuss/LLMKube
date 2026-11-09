@@ -196,7 +196,7 @@ func TestResolveModelStorePath(t *testing.T) {
 	t.Run("empty flag defaults under the home directory", func(t *testing.T) {
 		userHomeDir = func() (string, error) { return "/Users/tester", nil }
 		got, err := resolveModelStorePath("")
-		want := "/Users/tester/Library/Application Support/llmkube/models"
+		want := filepath.Join(agent.DefaultDataDir("/Users/tester"), "models")
 		if err != nil || got != want {
 			t.Fatalf("resolveModelStorePath(\"\") = %q, %v; want %q", got, err, want)
 		}

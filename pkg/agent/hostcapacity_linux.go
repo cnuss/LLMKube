@@ -19,15 +19,41 @@ package agent
 import (
 	"math"
 	"os"
+	"strings"
 )
 
 // DetectHostCapacity reads the board or CPU name from /proc, and memory
 // through LinuxMemoryProvider so a cgroup limit is reported the same way the
 // memory budget sees it.
 func DetectHostCapacity() HostCapacity {
-	c := hostCapacityFromProc(os.ReadFile)
+	c := HostCapacity{Chip: hostChipFromProc(os.ReadFile)}
 	if total, err := (&LinuxMemoryProvider{}).TotalMemory(); err == nil && total > 0 && total <= math.MaxInt64 {
 		c.MemoryBytes = int64(total)
 	}
 	return c
+}
+
+// hostChipFromProc is the device-tree model when the board has one (Raspberry
+// Pi and other ARM boards), else the first cpuinfo "model name" or "Model"
+// line, else empty.
+func hostChipFromProc(readFile func(path string) ([]byte, error)) string {
+	if data, err := readFile("/proc/device-tree/model"); err == nil {
+		if chip := printablePrefix(strings.TrimSpace(strings.TrimRight(string(data), "\x00")), maxChipBytes); chip != "" {
+			return chip
+		}
+	}
+	data, err := readFile("/proc/cpuinfo")
+	if err != nil {
+		return ""
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		key, val, ok := strings.Cut(line, ":")
+		if !ok {
+			continue
+		}
+		if k := strings.TrimSpace(key); k == "model name" || k == "Model" {
+			return printablePrefix(strings.TrimSpace(val), maxChipBytes)
+		}
+	}
+	return ""
 }

@@ -62,6 +62,25 @@ func fakeOllama(t *testing.T) (port int, models func() []string) {
 	}
 }
 
+func TestOllamaExecutorRefusesNonLibraryTag(t *testing.T) {
+	port, models := fakeOllama(t)
+	e := NewOllamaExecutor(port, zap.NewNop().Sugar())
+	for _, tag := range []string{
+		"attacker.example.com/x/backdoor:latest",
+		"someone/model",
+		"qwen2.5:1.5b@sha256:abc",
+		"Qwen:1.5b",
+		":1.5b",
+	} {
+		if _, err := e.StartProcess(context.Background(), ExecutorConfig{ModelName: "m", OllamaModel: tag}); err == nil {
+			t.Errorf("tag %q started; want it refused before any request to the daemon", tag)
+		}
+	}
+	if got := models(); len(got) != 0 {
+		t.Errorf("daemon saw %v; want no pull or load for a refused tag", got)
+	}
+}
+
 func TestOllamaExecutorModelTag(t *testing.T) {
 	for name, tc := range map[string]struct {
 		cfg  ExecutorConfig

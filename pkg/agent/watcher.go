@@ -125,6 +125,9 @@ type InferenceServiceWatcher struct {
 	localNetworkHinted bool
 	// apiHost is the API server's host; see SetAPIServer.
 	apiHost string
+	// accelerator is the Model accelerator this agent serves; see
+	// SetAccelerator.
+	accelerator string
 	// goos is the system the Local Network hint is for: runtime.GOOS unless
 	// a test sets another.
 	goos string
@@ -149,7 +152,18 @@ func NewInferenceServiceWatcher(
 		pollInterval:           defaultPollInterval,
 		now:                    time.Now,
 		goos:                   runtime.GOOS,
+		accelerator:            inferencev1alpha1.AcceleratorMetal,
 	}
+}
+
+// SetAccelerator sets the Model accelerator this agent serves ("metal" or
+// "npu"); empty keeps "metal". Models with any other accelerator are not
+// watched, so a Mac and a Linux NPU host never take each other's services.
+func (w *InferenceServiceWatcher) SetAccelerator(accelerator string) {
+	if accelerator == "" {
+		accelerator = inferencev1alpha1.AcceleratorMetal
+	}
+	w.accelerator = accelerator
 }
 
 // SetMaxConsecutiveFailures overrides how many consecutive failed lists make
@@ -538,7 +552,8 @@ func (w *InferenceServiceWatcher) poll(
 //     InferenceService isn't on this node's list. v0.2 #524: lets
 //     multi-Mac fleets partition without colliding.
 //  2. Model.spec.hardware.accelerator check -- looks up the referenced
-//     Model and returns true only when its accelerator is "metal".
+//     Model and returns true only when its accelerator is the one this
+//     agent serves ("metal" unless SetAccelerator chose "npu").
 //
 // A NotFound Model means the service is not ours. Any other lookup error (a
 // timeout, client-side throttling, a 5xx while the API server restarts) is
@@ -600,7 +615,7 @@ func (w *InferenceServiceWatcher) decideWatch(
 		return false, fmt.Errorf("get model %s/%s: %w", isvc.Namespace, isvc.Spec.ModelRef, err)
 	}
 
-	return model.Spec.Hardware != nil && model.Spec.Hardware.Accelerator == "metal", nil
+	return model.Spec.Hardware != nil && model.Spec.Hardware.Accelerator == w.accelerator, nil
 }
 
 // noteLookupFailed records a failed Model lookup for isvc: a Warn when this
