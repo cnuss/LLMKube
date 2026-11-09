@@ -42,7 +42,7 @@ Tracking issue: [#2481](https://github.com/defilantech/LLMKube/issues/2481).
 | `runtime: ollama` against `hailo-ollama` | Tested against the [Hailo-10H simulator](#testing-without-a-hat), not yet on a real AI HAT+ 2 |
 | llama.cpp (`llama-server`) on Linux | Untested. The agent's llama.cpp defaults (flash attention, mlock) are tuned for Apple Silicon |
 | `llmkube metal join` | Refuses Linux. Join [by hand](#join-the-host) |
-| Release artifacts | None for Linux. [Build the agent](#build-the-agent) from source |
+| Release artifacts | `LLMKube-metal-agent_<version>_linux_arm64.tar.gz` and `_linux_amd64.tar.gz` on the GitHub release, static (`CGO_ENABLED=0`), listed in `checksums.txt`. No Homebrew cask or distro package. The released binary is untested on a Pi |
 | Raspberry Pi OS kernel (16K pages) | Untested. The tests above ran on a 4K-page kernel |
 | `llmkube deploy` for a Linux host | Untested. Write the Model and InferenceService by hand |
 
