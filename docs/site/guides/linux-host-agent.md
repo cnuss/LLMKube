@@ -9,17 +9,18 @@ The [Metal agent](/docs/guides/macos-metal) also starts on Linux. It joins the c
 the same way a Mac does (a `MetalNode`, a Lease heartbeat, the dial-back check
 and the in-cluster relay), and runs a daemon engine on the host.
 
-On Linux the agent serves Models with `hardware.accelerator: npu`
-(experimental), where a Mac serves `metal`. Each agent only takes Models with
-its own accelerator, so Macs and Linux hosts in the same namespace never pick
-up each other's services. `--accelerator` overrides the default (`metal` on
-macOS, `npu` on Linux). With `npu`, the agent logs a warning at startup when
-it finds no Hailo device node (`/dev/hailo*`).
+Models served by a Linux host use `hardware.accelerator: metal`, like a Mac's:
+`metal` is what sends a service to a host agent instead of in-cluster pods. On
+Linux the agent logs `Metal not available; Linux host support is
+experimental` at startup, and whether it found a Hailo device node
+(`/dev/hailo*`).
 
-Routing a service to a host by its accelerator value is interim. The proposal
-in [#2481](https://github.com/defilantech/LLMKube/issues/2481) keeps
-`accelerator` as the hardware a model needs and makes placement on a
-`MetalNode` explicit, so this may change.
+Every agent in a namespace considers every `metal` service. When a Linux host
+and Macs share a namespace, give each agent the services it should run with
+`--inference-service-allowlist` (comma-separated InferenceService names), or
+the agents will claim each other's services. Making placement on a
+`MetalNode` explicit is proposed in
+[#2481](https://github.com/defilantech/LLMKube/issues/2481).
 
 Tracking issue: [#2481](https://github.com/defilantech/LLMKube/issues/2481).
 
@@ -27,13 +28,13 @@ Tracking issue: [#2481](https://github.com/defilantech/LLMKube/issues/2481).
 
 | | Status |
 |---|---|
-| linux/arm64 agent, `runtime: ollama` with stock Ollama on CPU | Tested in kind before `npu` existed, with the Model marked `metal`. Not a supported setup: a Linux agent serves `npu` Models, and a model that runs on the CPU is not one |
+| linux/arm64 agent, `runtime: ollama` with stock Ollama on CPU | Tested in kind: `Reachable=True`, chat completions through the relay. Run it like hailo-ollama below, with `--ollama-port 11434` |
 | `runtime: ollama` against `hailo-ollama` | Tested against the [Hailo-10H simulator](#testing-without-a-hat), not yet on a real AI HAT+ 2 |
 | llama.cpp (`llama-server`) on Linux | Untested. The agent's llama.cpp defaults (flash attention, mlock) are tuned for Apple Silicon |
 | `llmkube metal join` | Refuses Linux. Join [by hand](#join-the-host) |
 | Release artifacts | None for Linux. [Build the agent](#build-the-agent) from source |
 | Raspberry Pi OS kernel (16K pages) | Untested. The tests above ran on a 4K-page kernel |
-| `llmkube deploy --accelerator npu` | Not supported yet. Write the Model and InferenceService by hand |
+| `llmkube deploy` for a Linux host | Untested. Write the Model and InferenceService by hand |
 
 ## Build the agent
 
@@ -93,7 +94,8 @@ llmkube-metal-agent \
   --metal-node pi5 \
   --renew-service-account-token \
   --runtime ollama \
-  --ollama-port 8000
+  --ollama-port 8000 \
+  --inference-service-allowlist qwen-hailo
 ```
 
 The model store and state directory default to
@@ -147,7 +149,16 @@ spec:
   source: https://huggingface.co/Qwen/Qwen2.5-1.5B-Instruct-GGUF/resolve/main/qwen2.5-1.5b-instruct-q4_k_m.gguf
   format: gguf
   hardware:
-    accelerator: npu
+    accelerator: metal
+---
+apiVersion: inference.llmkube.dev/v1alpha1
+kind: InferenceService
+metadata:
+  name: qwen-hailo
+spec:
+  modelRef: qwen25-15b
+  runtime: ollama
+  replicas: 1
 ```
 
 Like any Model change, editing the annotation does not restart a running

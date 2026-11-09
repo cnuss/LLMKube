@@ -66,7 +66,6 @@ type AgentConfig struct {
 	LlamaServerBin            string
 	LlamaServerPort           int
 	Runtime                   string
-	Accelerator               string
 	OMLXBin                   string
 	OMLXPort                  int
 	OllamaPort                int
@@ -528,14 +527,6 @@ func llamaServerInstallHint(goos string) string {
 	return "your distribution's llama.cpp package or a source build of llama-server"
 }
 
-// defaultAccelerator is the --accelerator default for goos.
-func defaultAccelerator(goos string) string {
-	if goos == "linux" {
-		return inferencev1alpha1.AcceleratorNPU
-	}
-	return inferencev1alpha1.AcceleratorMetal
-}
-
 // hailoDeviceGlob matches the device nodes the Hailo PCIe driver creates.
 const hailoDeviceGlob = "/dev/hailo*"
 
@@ -546,41 +537,31 @@ var (
 	globDevices        = filepath.Glob
 )
 
-// checkHostPlatform resolves --accelerator and returns an error unless the
-// host can serve it: "metal" needs Metal, "npu" needs Linux (experimental).
-// An "npu" host with no Hailo device node only warns, since other NPUs are not
-// detected.
-func checkHostPlatform(logger *zap.SugaredLogger, accelerator string) (string, platform.Capabilities, error) {
-	if accelerator == "" {
-		accelerator = defaultAccelerator(hostGOOS)
-	}
-	logger.Infow("checking host platform", "accelerator", accelerator)
+// checkHostPlatform returns an error unless the host has Metal or is Linux,
+// where support is experimental and the engine brings its own accelerator. On
+// Linux it logs whether a Hailo device node is present.
+func checkHostPlatform(logger *zap.SugaredLogger) (platform.Capabilities, error) {
+	logger.Infow("checking Metal support")
 	caps := detectCapabilities()
-	switch accelerator {
-	case inferencev1alpha1.AcceleratorMetal:
-		if !caps.Metal {
-			return accelerator, caps, errors.New(
-				"metal support not detected: --accelerator=metal needs macOS with Apple Silicon; on Linux use --accelerator=npu")
-		}
+	switch {
+	case caps.Metal:
 		logger.Infow("Metal support detected",
 			"gpuName", caps.GPUName,
 			"gpuCores", caps.GPUCores,
 			"metalVersion", caps.MetalVersion,
 		)
-	case inferencev1alpha1.AcceleratorNPU:
-		if hostGOOS != "linux" {
-			return accelerator, caps, fmt.Errorf("--accelerator=npu is only supported on Linux, not %s", hostGOOS)
-		}
-		logger.Warnw("serving accelerator npu; Linux host support is experimental", "arch", caps.Arch)
+	case hostGOOS == "linux":
+		logger.Warnw("Metal not available; Linux host support is experimental", "arch", caps.Arch)
 		if devices, _ := globDevices(hailoDeviceGlob); len(devices) > 0 {
 			logger.Infow("Hailo device detected", "devices", devices)
 		} else {
-			logger.Warnw("no NPU device found; the engine must bring its own accelerator", "checked", hailoDeviceGlob)
+			logger.Infow("no Hailo device found", "checked", hailoDeviceGlob)
 		}
 	default:
-		return accelerator, caps, fmt.Errorf("invalid --accelerator %q: want metal or npu", accelerator)
+		return caps, fmt.Errorf("metal support not detected on %s: the agent needs macOS with Apple Silicon, "+
+			"or Linux (experimental)", hostGOOS)
 	}
-	return accelerator, caps, nil
+	return caps, nil
 }
 
 // resolveOptionalRuntimeBins resolves the binaries of the non-default
@@ -670,9 +651,6 @@ func main() {
 			"clients (e.g. an OpenAI-compatible tool pointed at localhost).")
 	flag.StringVar(&cfg.Runtime, "runtime", "llama-server",
 		"Inference runtime: llama-server, omlx, ollama, vllm-swift, mlx-server, or tensorfold")
-	flag.StringVar(&cfg.Accelerator, "accelerator", "",
-		"Model spec.hardware.accelerator this agent serves: metal or npu (experimental). "+
-			"Default: metal on macOS, npu on Linux.")
 	flag.StringVar(&cfg.OMLXBin, "omlx-bin", "", "Path to omlx binary (auto-detected if not set)")
 	flag.IntVar(&cfg.OMLXPort, "omlx-port", 8000, "Port for oMLX server")
 	flag.IntVar(&cfg.OllamaPort, "ollama-port", 11434, "Port for Ollama server")
@@ -886,12 +864,11 @@ func main() {
 		"engineEnvPassthrough", engineEnvPassthrough,
 	)
 
-	accelerator, caps, err := checkHostPlatform(logger, cfg.Accelerator)
+	caps, err := checkHostPlatform(logger)
 	if err != nil {
-		logger.Errorw("host cannot serve the accelerator", "error", err)
+		logger.Errorw("unsupported host", "error", err)
 		os.Exit(1)
 	}
-	cfg.Accelerator = accelerator
 
 	maxDownloadBytes, err := resolveMaxDownloadBytes(cfg.MaxDownloadSize, agent.NewHostMemoryProvider().TotalMemory)
 	if err != nil {
@@ -975,7 +952,6 @@ func main() {
 		LlamaServerBin:            cfg.LlamaServerBin,
 		LlamaServerPort:           cfg.LlamaServerPort,
 		Runtime:                   cfg.Runtime,
-		Accelerator:               cfg.Accelerator,
 		Version:                   Version,
 		OMLXBin:                   cfg.OMLXBin,
 		OMLXPort:                  cfg.OMLXPort,

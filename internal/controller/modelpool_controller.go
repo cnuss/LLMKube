@@ -726,7 +726,7 @@ func (r *ModelPoolReconciler) metalMembers(ctx context.Context, pool *inferencev
 		if err != nil {
 			return nil, err
 		}
-		if isMetalModel(model) {
+		if model.Spec.Hardware != nil && model.Spec.Hardware.Accelerator == acceleratorMetal {
 			metal = append(metal, name)
 		}
 	}

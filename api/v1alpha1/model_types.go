@@ -317,10 +317,7 @@ type HardwareSpec struct {
 	// it resolves to devic.es/dri-render rather than amd.com/gpu, since
 	// the two runtimes share the same physical device on single-GPU AMD
 	// nodes. The tiers differ only in the container image they select.
-	// "metal" and "npu" are served by the host agent rather than pods:
-	// "metal" by an Apple Silicon Mac, "npu" (experimental) by a Linux host
-	// with a neural accelerator, such as a Raspberry Pi 5 with an AI HAT+ 2.
-	// +kubebuilder:validation:Enum=cpu;metal;npu;cuda;rocm;intel;vulkan
+	// +kubebuilder:validation:Enum=cpu;metal;cuda;rocm;intel;vulkan
 	// +kubebuilder:default=cpu
 	// +optional
 	Accelerator string `json:"accelerator,omitempty"`

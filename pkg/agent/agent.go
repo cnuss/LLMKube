@@ -106,9 +106,6 @@ type MetalAgentConfig struct {
 	// "tensorfold". A CR that sets spec.runtime overrides it (see
 	// resolveRuntime).
 	Runtime string
-	// Accelerator is the Model spec.hardware.accelerator this agent serves:
-	// "metal" (the default when empty) or "npu".
-	Accelerator string
 	// OMLXBin is the path to the omlx binary. Only used when Runtime is "omlx".
 	OMLXBin string
 	// OMLXPort is the port the shared oMLX daemon listens on (default 8000).
@@ -1907,7 +1904,6 @@ func (a *MetalAgent) markStopped(ctx context.Context, isvc *inferencev1alpha1.In
 // the agent's config.
 func (a *MetalAgent) newWatcher() *InferenceServiceWatcher {
 	w := NewInferenceServiceWatcher(a.config.K8sClient, a.config.Namespace, a.logger.With("subsystem", "watcher"))
-	w.SetAccelerator(a.config.Accelerator)
 	if a.config.MaxWatchFailures > 0 {
 		w.SetMaxConsecutiveFailures(a.config.MaxWatchFailures)
 	}

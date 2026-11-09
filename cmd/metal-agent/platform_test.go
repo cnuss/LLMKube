@@ -37,34 +37,26 @@ func TestCheckHostPlatform(t *testing.T) {
 	noHat := func(string) ([]string, error) { return nil, nil }
 
 	for _, tc := range []struct {
-		name, goos, flag string
-		caps             platform.Capabilities
-		glob             func(string) ([]string, error)
-		want, wantErr    string
+		name, goos string
+		caps       platform.Capabilities
+		glob       func(string) ([]string, error)
+		wantErr    bool
 	}{
-		{name: "mac default", goos: "darwin", caps: mac, glob: noHat, want: "metal"},
-		{name: "linux default", goos: "linux", caps: pi, glob: hat, want: "npu"},
-		{name: "linux npu without a device still starts", goos: "linux", flag: "npu", caps: pi, glob: noHat, want: "npu"},
-		{name: "metal without Metal", goos: "linux", flag: "metal", caps: pi, glob: noHat,
-			wantErr: "metal support not detected"},
-		{name: "npu off Linux", goos: "darwin", flag: "npu", caps: mac, glob: hat, wantErr: "only supported on Linux"},
-		{name: "unknown accelerator", goos: "linux", flag: "cuda", caps: pi, glob: hat, wantErr: "invalid --accelerator"},
+		{name: "mac with Metal", goos: "darwin", caps: mac, glob: noHat},
+		{name: "linux with a Hailo device", goos: "linux", caps: pi, glob: hat},
+		{name: "linux without a device still starts", goos: "linux", caps: pi, glob: noHat},
+		{name: "mac without Metal", goos: "darwin", caps: platform.Capabilities{OS: "darwin"}, glob: noHat, wantErr: true},
+		{name: "other OS", goos: "freebsd", caps: platform.Capabilities{OS: "freebsd"}, glob: hat, wantErr: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			hostGOOS = tc.goos
 			detectCapabilities = func() platform.Capabilities { return tc.caps }
 			globDevices = tc.glob
-			got, caps, err := checkHostPlatform(zap.NewNop().Sugar(), tc.flag)
-			if tc.wantErr != "" {
-				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
-					t.Fatalf("err = %v, want one containing %q", err, tc.wantErr)
-				}
-				return
+			caps, err := checkHostPlatform(zap.NewNop().Sugar())
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("err = %v, want error %v", err, tc.wantErr)
 			}
-			if err != nil || got != tc.want {
-				t.Fatalf("checkHostPlatform = %q, %v; want %q", got, err, tc.want)
-			}
-			if caps != tc.caps {
+			if err == nil && caps != tc.caps {
 				t.Errorf("caps = %+v, want the detected %+v passed through", caps, tc.caps)
 			}
 		})
