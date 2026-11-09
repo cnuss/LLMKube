@@ -27,7 +27,7 @@ Tracking issue: [#2481](https://github.com/defilantech/LLMKube/issues/2481).
 
 | | Status |
 |---|---|
-| linux/arm64 agent, `runtime: ollama` with stock Ollama on CPU | Tested in kind: `Reachable=True`, chat completions through the relay |
+| linux/arm64 agent, `runtime: ollama` with stock Ollama on CPU | Tested in kind before `npu` existed, with the Model marked `metal`. Not a supported setup: a Linux agent serves `npu` Models, and a model that runs on the CPU is not one |
 | `runtime: ollama` against `hailo-ollama` | Tested against the [Hailo-10H simulator](#testing-without-a-hat), not yet on a real AI HAT+ 2 |
 | llama.cpp (`llama-server`) on Linux | Untested. The agent's llama.cpp defaults (flash attention, mlock) are tuned for Apple Silicon |
 | `llmkube metal join` | Refuses Linux. Join [by hand](#join-the-host) |
@@ -93,7 +93,7 @@ llmkube-metal-agent \
   --metal-node pi5 \
   --renew-service-account-token \
   --runtime ollama \
-  --ollama-port 11434
+  --ollama-port 8000
 ```
 
 The model store and state directory default to
@@ -123,37 +123,6 @@ its cgroup, so `runtime: ollama` services are admitted against the host's
 For a fit decision that does not depend on the machine, as in tests, set
 `spec.hardware.memoryBudget` on the Model. It may not exceed the host budget.
 
-## Ollama on CPU
-
-Run Ollama on the host, listening on `127.0.0.1`, and use `runtime: ollama`
-with `accelerator: npu`, the value a Linux agent serves. The Ollama tag is the Model's name, mapped through the agent's built-in table
-for a few known names, and the agent always pulls it from the registry, so a
-tag that exists only locally fails.
-
-```yaml
-apiVersion: inference.llmkube.dev/v1alpha1
-kind: Model
-metadata:
-  name: tinyllama
-spec:
-  source: https://huggingface.co/TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF/resolve/main/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf
-  format: gguf
-  hardware:
-    accelerator: npu
----
-apiVersion: inference.llmkube.dev/v1alpha1
-kind: InferenceService
-metadata:
-  name: tinyllama-pi
-spec:
-  modelRef: tinyllama
-  runtime: ollama
-  replicas: 1
-```
-
-`spec.source` is only used for the memory estimate; Ollama manages its own
-model storage.
-
 ## Hailo AI HAT+ 2
 
 Hailo's [hailo-ollama](https://github.com/hailo-ai/hailo_model_zoo_genai)
@@ -164,7 +133,8 @@ Every hailo-ollama tag has the form `name:tag`, which a Kubernetes name cannot
 spell, and hailo-ollama has no implicit `:latest`. Name the tag with the
 experimental `llmkube.ai/ollama-model` annotation. Only library tags (`name`
 or `name:tag`) are accepted: a `/`, which would name another registry or
-namespace, is refused before anything reaches the daemon.
+namespace, is refused before anything reaches the daemon. `spec.source` is
+only used for the memory estimate; hailo-ollama manages its own model storage.
 
 ```yaml
 apiVersion: inference.llmkube.dev/v1alpha1
