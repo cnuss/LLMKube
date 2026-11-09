@@ -15,11 +15,21 @@ Linux the agent logs `Metal not available; Linux host support is
 experimental` at startup, and whether it found a Hailo device node
 (`/dev/hailo*`).
 
-Every agent in a namespace considers every `metal` service. When a Linux host
-and Macs share a namespace, give each agent the services it should run with
-`--inference-service-allowlist` (comma-separated InferenceService names), or
-the agents will claim each other's services. Making placement on a
-`MetalNode` explicit is proposed in
+Every agent watches one namespace (`--namespace`) and considers every `metal`
+service in it, so keep a Linux host's services apart from the Macs':
+
+- **Use a namespace of its own (recommended).** Create the host's identity in
+  that namespace (`llmkube metal token create pi5 -n pi`) and put its Models
+  and InferenceServices there. No Mac agent sees them.
+- **Or allowlist every agent in a shared namespace**, the Macs included, with
+  `--inference-service-allowlist` (comma-separated InferenceService names).
+  An allowlist only limits the agent it is set on. A Mac without one claims
+  the Linux host's services too: every agent registers the Ollama runtime, so
+  a Mac running Ollama can quietly serve the registry's copy of the same tag,
+  and one without it refuses the service and writes status over the Linux
+  host's.
+
+Making placement on a `MetalNode` explicit is proposed in
 [#2481](https://github.com/defilantech/LLMKube/issues/2481).
 
 Tracking issue: [#2481](https://github.com/defilantech/LLMKube/issues/2481).
@@ -49,15 +59,16 @@ Where you have cluster access, create the host's identity as for a Mac. This
 creates its ServiceAccount, RBAC, Lease and `MetalNode`, plus a join Secret:
 
 ```sh
-llmkube metal token create pi5 -n default
+kubectl create namespace pi
+llmkube metal token create pi5 -n pi
 ```
 
 `metal join` cannot redeem the join string on Linux, so delete the unused
 join Secret and mint the agent's token directly:
 
 ```sh
-kubectl -n default delete secret llmkube-metal-pi5-join
-kubectl -n default create token llmkube-metal-pi5 --duration=24h > token
+kubectl -n pi delete secret llmkube-metal-pi5-join
+kubectl -n pi create token llmkube-metal-pi5 --duration=24h > token
 chmod 600 token
 ```
 
@@ -78,7 +89,7 @@ users:
     tokenFile: /path/to/token
 contexts:
 - name: pi5
-  context: {cluster: llmkube, user: pi5, namespace: default}
+  context: {cluster: llmkube, user: pi5, namespace: pi}
 current-context: pi5
 ```
 
@@ -90,12 +101,11 @@ than that needs a new token.
 ```sh
 llmkube-metal-agent \
   --kubeconfig /path/to/kubeconfig \
-  --namespace default \
+  --namespace pi \
   --metal-node pi5 \
   --renew-service-account-token \
   --runtime ollama \
-  --ollama-port 8000 \
-  --inference-service-allowlist qwen-hailo
+  --ollama-port 8000
 ```
 
 The model store and state directory default to
@@ -106,7 +116,7 @@ and `--state-dir` override them.
 Then wait for the `MetalNode` to report `Reachable=True`:
 
 ```sh
-kubectl get metalnode pi5 -n default
+kubectl get metalnode pi5 -n pi
 ```
 
 ## Memory
