@@ -31,8 +31,8 @@ import (
 
 // fakeOllama answers the routes OllamaExecutor calls and records the model
 // each pull or load names. hailoList non-nil makes it hailo-ollama, serving
-// GET /hailo/v1/list with those tags and reporting size for them in /api/tags.
-func fakeOllama(t *testing.T, hailoList []string, size uint64) (port int, models func() []string) {
+// GET /hailo/v1/list with those tags.
+func fakeOllama(t *testing.T, hailoList []string) (port int, models func() []string) {
 	t.Helper()
 	var mu sync.Mutex
 	var seen []string
@@ -59,17 +59,6 @@ func fakeOllama(t *testing.T, hailoList []string, size uint64) (port int, models
 		mux.HandleFunc("GET /hailo/v1/list", func(w http.ResponseWriter, _ *http.Request) {
 			_ = json.NewEncoder(w).Encode(hailoListResponse{Models: hailoList})
 		})
-		mux.HandleFunc("GET /api/tags", func(w http.ResponseWriter, _ *http.Request) {
-			var out ollamaTagsResponse
-			for _, m := range hailoList {
-				out.Models = append(out.Models, struct {
-					Name  string `json:"name"`
-					Model string `json:"model"`
-					Size  uint64 `json:"size"`
-				}{Name: m, Model: m, Size: size})
-			}
-			_ = json.NewEncoder(w).Encode(out)
-		})
 	}
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
@@ -91,7 +80,7 @@ func TestOllamaExecutorModelTag(t *testing.T) {
 		"unmapped name as tag": {ExecutorConfig{ModelName: "tinyllama"}, "tinyllama"},
 	} {
 		t.Run(name, func(t *testing.T) {
-			port, models := fakeOllama(t, hailo, 0)
+			port, models := fakeOllama(t, hailo)
 			e := NewOllamaExecutor(port, zap.NewNop().Sugar())
 			p, err := e.StartProcess(context.Background(), tc.cfg)
 			if err != nil {
@@ -123,7 +112,7 @@ func TestOllamaExecutorRefusesHailoSourceItCannotServe(t *testing.T) {
 		},
 	} {
 		t.Run(name, func(t *testing.T) {
-			port, models := fakeOllama(t, tc.hailoList, 0)
+			port, models := fakeOllama(t, tc.hailoList)
 			e := NewOllamaExecutor(port, zap.NewNop().Sugar())
 			_, err := e.StartProcess(context.Background(), ExecutorConfig{ModelName: "m", ModelSource: tc.source})
 			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
@@ -133,23 +122,5 @@ func TestOllamaExecutorRefusesHailoSourceItCannotServe(t *testing.T) {
 				t.Errorf("daemon saw %v; want no pull or load for a refused source", got)
 			}
 		})
-	}
-}
-
-func TestHailoModelSize(t *testing.T) {
-	port, models := fakeOllama(t, []string{"qwen2.5:1.5b"}, 2495056733)
-	e := NewOllamaExecutor(port, zap.NewNop().Sugar())
-	size, err := e.HailoModelSize(context.Background(), "qwen2.5:1.5b")
-	if err != nil || size != 2495056733 {
-		t.Fatalf("HailoModelSize = %d, %v; want the HEF size the daemon reports", size, err)
-	}
-	if got := models(); len(got) != 1 || got[0] != "qwen2.5:1.5b" {
-		t.Errorf("daemon saw %v; want one pull of the tag before it is sized", got)
-	}
-
-	stock, _ := fakeOllama(t, nil, 0)
-	stockExec := NewOllamaExecutor(stock, zap.NewNop().Sugar())
-	if _, err := stockExec.HailoModelSize(context.Background(), "qwen2.5:1.5b"); err == nil {
-		t.Error("sizing a hailo tag on stock Ollama: want an error, not the registry model's size")
 	}
 }

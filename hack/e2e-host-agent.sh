@@ -6,7 +6,11 @@
 #   - every MetalNode passes the dial-back,
 #   - each host serves its own hailo:// InferenceService through the relay,
 #     and only its own (Endpoints point at that host, logs never name the other),
+#   - memory admission sizes a hailo:// source with a HEAD of its HEF on Hailo's
+#     model host, before hailo-ollama pulls anything,
 #   - a hailo:// Model on another accelerator is Failed with InvalidSource.
+#
+# The HEAD reaches dev-public.hailo.ai, so the run needs internet access.
 #
 # Needs docker, kind, kubectl and go. KEEP=true leaves the cluster and
 # containers up for inspection.
@@ -19,7 +23,7 @@ ROUTER_PROXY_IMG=${ROUTER_PROXY_IMG:-ghcr.io/defilantech/llmkube-router-proxy:de
 HAILO_SIM_IMG=${HAILO_SIM_IMG:-localhost/llmkube-hailo-sim:dev}
 KUSTOMIZE=${KUSTOMIZE:-$ROOT/bin/kustomize}
 CURL_IMG=curlimages/curl:8.11.1
-AGENT_BASE_IMG=debian:bookworm-slim
+AGENT_BASE_IMG=gcr.io/distroless/static-debian12:latest
 KEEP=${KEEP:-false}
 HOSTS=(pi mac)
 
@@ -136,11 +140,16 @@ EOF
 	chmod 600 "$dir/token" "$dir/kubeconfig"
 	docker run -d --name "$h-engine" --hostname "$h" --network kind \
 		-e OLLAMA_HOST=127.0.0.1:8000 "$HAILO_SIM_IMG" >/dev/null
+	# The agent reads hailo-ollama's manifests and version to size hailo://
+	# sources; on a real host they are on its filesystem.
+	docker cp "$h-engine:/usr/local/share/hailo-ollama/models/manifests" "$dir/manifests"
+	hailo_version=$(docker exec "$h-engine" cat /usr/local/share/hailo-sim/version)
 	docker run -d --name "$h-agent" --network "container:$h-engine" \
 		-v "$dir:/host" -v "$WORK/llmkube-metal-agent:/usr/local/bin/llmkube-metal-agent:ro" \
 		"$AGENT_BASE_IMG" llmkube-metal-agent \
 		--kubeconfig /host/kubeconfig --namespace "$h" --metal-node "$h" \
-		--renew-service-account-token --runtime ollama --ollama-port 8000 >/dev/null
+		--renew-service-account-token --runtime ollama --ollama-port 8000 \
+		--hailo-version "$hailo_version" --hailo-manifests-dir /host/manifests >/dev/null
 }
 
 deploy_service() {
@@ -210,6 +219,15 @@ for h in "${HOSTS[@]}"; do
 	*"\"model\":\"$(tag "$h")\""*"hailo-sim: hello from $h"*) ;;
 	*) fail "unexpected reply from $h-svc: $reply" ;;
 	esac
+done
+
+log "memory admission sizes hailo:// before anything is pulled"
+for h in "${HOSTS[@]}"; do
+	agent_log=$(docker logs "$h-agent" 2>&1)
+	admitted=$(grep -n '"memory check passed"' <<<"$agent_log" | head -1 | cut -d: -f1)
+	pulled=$(grep -n '"pulling Ollama model' <<<"$agent_log" | head -1 | cut -d: -f1)
+	[ -n "$admitted" ] && [ -n "$pulled" ] && [ "$admitted" -lt "$pulled" ] ||
+		fail "$h agent: memory check (line '$admitted') must pass before the first pull (line '$pulled')"
 done
 
 log "each host serves only its own namespace"

@@ -105,8 +105,12 @@ llmkube-metal-agent \
   --metal-node pi5 \
   --renew-service-account-token \
   --runtime ollama \
-  --ollama-port 8000
+  --ollama-port 8000 \
+  --hailo-version 5.5.0
 ```
+
+`--hailo-version` is the version of the installed hailo-ollama (`5.5.0` for
+hailo-ollama 5.5.0); the agent needs it to size `hailo://` models, see below.
 
 The model store and state directory default to
 `$XDG_DATA_HOME/llmkube/models` and `$XDG_DATA_HOME/llmkube/metal-agent`
@@ -155,6 +159,17 @@ hailo-ollama (it serves `GET /hailo/v1/list`) and that it lists the tag, so a
 host running stock Ollama refuses the service instead of pulling a different
 model under the same name.
 
+Memory admission sizes a `hailo://` model the way it sizes an `https://` one,
+with a HEAD request and nothing downloaded: the agent reads the HEF filename
+from hailo-ollama's manifests (the directories hailo-ollama reads, or
+`--hailo-manifests-dir`), and HEADs that HEF on Hailo's model host
+(`--hailo-library-url`) at the blob version hailo-ollama would pull for
+`--hailo-version`, including its fallback to an earlier minor version. The
+HEAD goes through `--allowed-download-hosts` like any other download, so a
+host that sets that flag must list `dev-public.hailo.ai`, and it verifies TLS
+against the system's CA certificates, which Raspberry Pi OS ships (a minimal
+container image may not).
+
 ```yaml
 apiVersion: inference.llmkube.dev/v1alpha1
 kind: Model
@@ -186,10 +201,12 @@ Known limits, from hailo-ollama's server code:
 - Requests need `Content-Type: application/json`.
 - hailo-ollama keeps one model loaded and reloads on every switch, so run one
   `InferenceService` per HAT.
-- The memory estimate is the HEF's size as hailo-ollama reports it, so the
-  agent pulls the HEF (2.3 GiB for `qwen2.5:1.5b`) before admitting the
-  service. The budget it is checked against is the Pi's RAM, not the HAT's
-  8 GB. To test the HAT's limit, use the simulator's `HAILO_SIM_DEVICE_MEMORY`.
+- The memory estimate is the HEF's size (2.3 GiB for `qwen2.5:1.5b`), but
+  the budget it is checked against is the Pi's RAM, not the HAT's 8 GB. To
+  test the HAT's limit, use the simulator's `HAILO_SIM_DEVICE_MEMORY`.
+- Sizing reproduces how hailo-ollama resolves a model to a file (its manifest
+  layout and blob versions), so a hailo-ollama release that changes either
+  breaks it until the agent follows.
 
 ## Testing without a HAT
 

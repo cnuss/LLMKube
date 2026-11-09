@@ -136,49 +136,6 @@ func (e *OllamaExecutor) requireHailoModel(ctx context.Context, tag string) erro
 		e.port, tag, strings.Join(list.Models, ", "))
 }
 
-// ollamaTagsResponse is GET /api/tags.
-type ollamaTagsResponse struct {
-	Models []struct {
-		Name  string `json:"name"`
-		Model string `json:"model"`
-		Size  uint64 `json:"size"`
-	} `json:"models"`
-}
-
-// HailoModelSize pulls tag into hailo-ollama, a no-op when its cache already
-// has it, and returns the size the daemon reports, the HEF's size on disk.
-func (e *OllamaExecutor) HailoModelSize(ctx context.Context, tag string) (uint64, error) {
-	if err := e.requireHailoModel(ctx, tag); err != nil {
-		return 0, err
-	}
-	if err := e.pullModel(ctx, tag); err != nil {
-		return 0, fmt.Errorf("pull %s: %w", tag, err)
-	}
-	url := fmt.Sprintf("http://127.0.0.1:%d/api/tags", e.port)
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-	if err != nil {
-		return 0, err
-	}
-	resp, err := e.httpClient.Do(req)
-	if err != nil {
-		return 0, fmt.Errorf("list models on port %d: %w", e.port, err)
-	}
-	defer drainAndClose(resp)
-	if resp.StatusCode != http.StatusOK {
-		return 0, fmt.Errorf("GET /api/tags returned %d", resp.StatusCode)
-	}
-	var tags ollamaTagsResponse
-	if err := json.NewDecoder(resp.Body).Decode(&tags); err != nil {
-		return 0, fmt.Errorf("decode /api/tags: %w", err)
-	}
-	for _, m := range tags.Models {
-		if (m.Name == tag || m.Model == tag) && m.Size > 0 {
-			return m.Size, nil
-		}
-	}
-	return 0, fmt.Errorf("hailo-ollama reports no size for %q after pulling it", tag)
-}
-
 // resolveOllamaModel maps a LLMKube model name to an Ollama model tag.
 // If no mapping exists, the original name is returned as-is (allowing users
 // to specify arbitrary Ollama model names in their Model CRD).

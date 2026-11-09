@@ -112,6 +112,15 @@ type MetalAgentConfig struct {
 	OMLXPort int
 	// OllamaPort is the port the Ollama daemon listens on (default 11434).
 	OllamaPort int
+	// HailoVersion is hailo-ollama's version (for example 5.5.0), the blob
+	// version it pulls HEFs at. Sizing a hailo:// source needs it.
+	HailoVersion string
+	// HailoManifestsDir is hailo-ollama's model manifest directory. Empty
+	// searches the directories hailo-ollama itself reads.
+	HailoManifestsDir string
+	// HailoLibraryURL is the host hailo-ollama pulls HEFs from. Empty means
+	// DefaultHailoLibraryURL.
+	HailoLibraryURL string
 	// VLLMSwiftBin is the path to the vllm-swift binary. Only used when
 	// Runtime is "vllm-swift". Empty means auto-detect via $PATH.
 	VLLMSwiftBin string
@@ -2675,18 +2684,37 @@ func (a *MetalAgent) estimateModelMemory(
 	}), nil
 }
 
-// hailoSizeProbe sizes a hailo:// source through the ollama runtime's
-// hailo-ollama, which reports a HEF's size only once it is pulled.
+// hailoSizeProbe sizes a hailo:// source like an http(s) one, with a HEAD
+// through the download allowlist: of the HEF hailo-ollama maps the tag to in
+// its manifests, at the blob version hailo-ollama would pull.
 func (a *MetalAgent) hailoSizeProbe(ctx context.Context, model *inferencev1alpha1.Model) (uint64, error) {
 	tag, _, err := inferencev1alpha1.HailoSourceTag(model.Spec.Source)
 	if err != nil {
 		return 0, err
 	}
-	exec, ok := a.executors[runtimeOllama].(*OllamaExecutor)
-	if !ok {
-		return 0, fmt.Errorf("no ollama runtime registered to size %s", model.Spec.Source)
+	if a.config.HailoVersion == "" {
+		return 0, errors.New("sizing a hailo:// source needs --hailo-version, hailo-ollama's version (for example 5.5.0)")
 	}
-	return exec.HailoModelSize(ctx, tag)
+	versions, err := hailoBlobVersions(a.config.HailoVersion)
+	if err != nil {
+		return 0, err
+	}
+	dirs := []string{a.config.HailoManifestsDir}
+	if a.config.HailoManifestsDir == "" {
+		home, _ := os.UserHomeDir()
+		dirs = hailoManifestDirs(home, os.Getenv("XDG_DATA_HOME"), os.Getenv("XDG_DATA_DIRS"))
+	}
+	hef, err := hailoHEFFilename(dirs, tag)
+	if err != nil {
+		return 0, err
+	}
+	base := a.config.HailoLibraryURL
+	if base == "" {
+		base = DefaultHailoLibraryURL
+	}
+	probeClient := safehttp.NewClient(a.downloadAllow, 0, downloadHostsFlag)
+	defer probeClient.CloseIdleConnections()
+	return hailoBlobSize(ctx, probeClient, base, versions, hef)
 }
 
 // probeRemoteModelSize sizes an http(s) source with a HEAD for its
