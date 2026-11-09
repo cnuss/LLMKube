@@ -160,12 +160,34 @@ spec: {modelRef: $h-model, runtime: ollama, replicas: 1}
 EOF
 }
 
-chat() { # HOST
-	local h=$1
-	kubectl -n "$h" run "chat-$h-$RANDOM" --rm -i --restart=Never --quiet --image="$CURL_IMG" -- \
-		curl -sS -m 60 "http://$h-svc.$h.svc.cluster.local:8080/v1/chat/completions" \
-		-H 'Content-Type: application/json' \
-		-d "{\"model\":\"$(tag "$h")\",\"messages\":[{\"role\":\"user\",\"content\":\"hello from $h\"}]}"
+# chat HOST prints the reply to one chat completion through the relay. Each try
+# runs curl in a pod and reads its log once the pod has finished, since
+# kubectl run --attach can miss the output of a pod that exits quickly.
+chat() {
+	local h=$1 pod reply="" phase try _
+	for try in 1 2 3; do
+		pod="chat-$h-$try-$RANDOM"
+		kubectl -n "$h" run "$pod" --restart=Never --image="$CURL_IMG" -- \
+			curl -sS -m 60 "http://$h-svc.$h.svc.cluster.local:8080/v1/chat/completions" \
+			-H 'Content-Type: application/json' \
+			-d "{\"model\":\"$(tag "$h")\",\"messages\":[{\"role\":\"user\",\"content\":\"hello from $h\"}]}" \
+			>/dev/null
+		for _ in $(seq 1 60); do
+			phase=$(kubectl -n "$h" get "pod/$pod" -o 'jsonpath={.status.phase}' 2>/dev/null || true)
+			case "$phase" in Succeeded | Failed) break ;; esac
+			sleep 2
+		done
+		reply=$(kubectl -n "$h" logs "pod/$pod" 2>&1 || true)
+		kubectl -n "$h" delete pod "$pod" --wait=false >/dev/null 2>&1 || true
+		case "$reply" in *hailo-sim:*)
+			printf '%s' "$reply"
+			return 0
+			;;
+		esac
+		sleep 5
+	done
+	printf '%s' "$reply"
+	return 1
 }
 
 log "hosts"
