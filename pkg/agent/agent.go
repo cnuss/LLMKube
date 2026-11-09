@@ -548,7 +548,7 @@ func NewMetalAgent(config MetalAgentConfig) *MetalAgent {
 	// Resolve memory provider
 	provider := config.MemoryProvider
 	if provider == nil {
-		provider = &DarwinMemoryProvider{}
+		provider = NewHostMemoryProvider()
 	}
 
 	// Resolve memory fraction

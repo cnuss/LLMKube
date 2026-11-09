@@ -25,6 +25,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	goruntime "runtime"
 	"strings"
 	"syscall"
 	"time"
@@ -248,11 +249,12 @@ func newLogger(level string) (*zap.Logger, error) {
 }
 
 // defaultLlamaServerPaths is the list of paths to search for llama-server,
-// in order of preference. Apple Silicon Homebrew installs to /opt/homebrew/bin,
-// Intel Homebrew installs to /usr/local/bin.
+// in order of preference: Apple Silicon Homebrew, Intel Homebrew or a source
+// install, then a Linux distribution package.
 var defaultLlamaServerPaths = []string{
 	"/opt/homebrew/bin/llama-server",
 	"/usr/local/bin/llama-server",
+	"/usr/bin/llama-server",
 }
 
 // statFunc is the function used to check file existence (overridden in tests).
@@ -498,6 +500,51 @@ func resolveOMLXBin(override string) (string, error) {
 		"omlx binary not found in default paths (%v); "+
 			"install with: brew install jundot/omlx/omlx, or pass --omlx-bin=/path/to/binary",
 		defaultOMLXPaths)
+}
+
+// resolveDefaultLlamaServerBin sets cfg.LlamaServerBin. A missing binary is
+// fatal only when --runtime selects llama.cpp; with another runtime the
+// agent starts and only services that select llama.cpp fail.
+func resolveDefaultLlamaServerBin(cfg *AgentConfig, override string, logger *zap.SugaredLogger) {
+	resolvedBin, err := resolveLlamaServerBin(override)
+	switch {
+	case err == nil:
+		cfg.LlamaServerBin = resolvedBin
+	case inferencev1alpha1.IsMetalOnlyRuntime(cfg.Runtime):
+		logger.Warnw("llama-server binary not found; services that select llama.cpp will fail to start",
+			"runtime", cfg.Runtime, "error", err)
+	default:
+		logger.Errorw("llama-server binary not found",
+			"searchPaths", defaultLlamaServerPaths,
+			"installHint", "brew install llama.cpp",
+			"error", err,
+		)
+		os.Exit(1)
+	}
+}
+
+// checkHostPlatform exits unless the host has Metal or is Linux, where
+// support is experimental and engines bring their own accelerator.
+func checkHostPlatform(logger *zap.SugaredLogger) platform.Capabilities {
+	logger.Infow("checking Metal support")
+	caps := platform.DetectCapabilities()
+	switch {
+	case caps.Metal:
+		logger.Infow("Metal support detected",
+			"gpuName", caps.GPUName,
+			"gpuCores", caps.GPUCores,
+			"metalVersion", caps.MetalVersion,
+		)
+	case goruntime.GOOS == "linux":
+		logger.Warnw("Metal not available; Linux host support is experimental",
+			"os", caps.OS, "arch", caps.Arch)
+	default:
+		logger.Errorw("Metal support not detected",
+			"requirement", "macOS with Apple Silicon (M1/M2/M3/M4), or Linux (experimental)",
+		)
+		os.Exit(1)
+	}
+	return caps
 }
 
 // resolveOptionalRuntimeBins resolves the binaries of the non-default
@@ -767,22 +814,12 @@ func main() {
 	// Kubernetes client/controller-runtime logs share the same configuration.
 
 	// Resolve runtime-specific binary paths. llama-server is always resolved
-	// because it is the default fallback runtime. Other runtimes are resolved
+	// because it is the default fallback runtime; it is fatal only when
+	// --runtime selects llama.cpp. Other runtimes are resolved
 	// when their binary path flag is set or when the agent's --runtime flag
 	// selects them, so the agent can host multiple runtimes concurrently
 	// (#525).
-	{
-		resolvedBin, err := resolveLlamaServerBin(llamaServerFlag)
-		if err != nil {
-			logger.Errorw("llama-server binary not found",
-				"searchPaths", defaultLlamaServerPaths,
-				"installHint", "brew install llama.cpp",
-				"error", err,
-			)
-			os.Exit(1)
-		}
-		cfg.LlamaServerBin = resolvedBin
-	}
+	resolveDefaultLlamaServerBin(cfg, llamaServerFlag, logger)
 	resolveOptionalRuntimeBins(cfg, logger)
 
 	hostIP := cfg.HostIP
@@ -805,35 +842,19 @@ func main() {
 		"engineEnvPassthrough", engineEnvPassthrough,
 	)
 
-	// Verify Metal support
-	logger.Infow("checking Metal support")
-	caps := platform.DetectCapabilities()
-	if !caps.Metal {
-		logger.Errorw("Metal support not detected",
-			"requirement", "macOS with Apple Silicon (M1/M2/M3/M4)",
-		)
-		os.Exit(1)
-	}
-	logger.Infow("Metal support detected",
-		"gpuName", caps.GPUName,
-		"gpuCores", caps.GPUCores,
-		"metalVersion", caps.MetalVersion,
-	)
+	caps := checkHostPlatform(logger)
 
-	// Resolved after the Metal check: its default reads the host's memory
-	// through the darwin provider, which is a stub elsewhere, so a non-Mac
-	// host should fail on Metal first.
-	maxDownloadBytes, err := resolveMaxDownloadBytes(cfg.MaxDownloadSize, (&agent.DarwinMemoryProvider{}).TotalMemory)
+	maxDownloadBytes, err := resolveMaxDownloadBytes(cfg.MaxDownloadSize, agent.NewHostMemoryProvider().TotalMemory)
 	if err != nil {
 		logger.Errorw("invalid --max-download-size", "error", err)
 		os.Exit(1)
 	}
 	logger.Infow("model download cap", "maxDownloadBytes", maxDownloadBytes)
 
-	// Log which runtimes are available. llama-server is always available
-	// (resolved above). Other runtimes are available when their binary
-	// path was resolved successfully.
-	logger.Infow("llama-server binary found", "path", cfg.LlamaServerBin)
+	// Log which runtimes are available: each one whose binary path resolved.
+	if cfg.LlamaServerBin != "" {
+		logger.Infow("llama-server binary found", "path", cfg.LlamaServerBin)
+	}
 	if cfg.OMLXBin != "" {
 		logger.Infow("omlx binary found", "path", cfg.OMLXBin)
 	}
