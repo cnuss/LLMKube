@@ -16,9 +16,18 @@ limitations under the License.
 
 package agent
 
-import "os"
+import (
+	"math"
+	"os"
+)
 
-// DetectHostCapacity reads memory and the board or CPU name from /proc.
+// DetectHostCapacity reads the board or CPU name from /proc, and memory
+// through LinuxMemoryProvider so a cgroup limit is reported the same way the
+// memory budget sees it.
 func DetectHostCapacity() HostCapacity {
-	return hostCapacityFromProc(os.ReadFile)
+	c := hostCapacityFromProc(os.ReadFile)
+	if total, err := (&LinuxMemoryProvider{}).TotalMemory(); err == nil && total > 0 && total <= math.MaxInt64 {
+		c.MemoryBytes = int64(total)
+	}
+	return c
 }

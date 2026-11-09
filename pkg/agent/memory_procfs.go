@@ -35,10 +35,74 @@ func NewHostMemoryProvider() MemoryProvider {
 	return &DarwinMemoryProvider{}
 }
 
-// LinuxMemoryProvider implements MemoryProvider from /proc.
+// LinuxMemoryProvider implements MemoryProvider from /proc, capped by the
+// cgroup v2 memory limit of the agent's own cgroup and its ancestors. Engines
+// the agent starts inherit that cgroup; a separately managed daemon (Ollama)
+// does not.
 type LinuxMemoryProvider struct {
 	// ProcRoot is the procfs mount; empty means /proc.
 	ProcRoot string
+	// CgroupRoot is the cgroup v2 mount; empty means /sys/fs/cgroup.
+	CgroupRoot string
+}
+
+// cgroupLimit is the tightest memory.max on the path from the agent's cgroup
+// to the root, and the room left under it (limit minus usage, with inactive
+// file cache counted as reclaimable). ok is false when no limit is set or
+// cgroup v2 is not mounted.
+func (p *LinuxMemoryProvider) cgroupLimit() (limit, room uint64, ok bool) {
+	root := p.CgroupRoot
+	if root == "" {
+		root = "/sys/fs/cgroup"
+	}
+	rel := "/"
+	if data, err := os.ReadFile(p.procPath("self", "cgroup")); err == nil {
+		for _, line := range strings.Split(string(data), "\n") {
+			if path, found := strings.CutPrefix(line, "0::"); found {
+				rel = path
+				break
+			}
+		}
+	}
+	for dir := filepath.Join(root, rel); ; dir = filepath.Dir(dir) {
+		if l, r, set := readCgroupMemory(dir); set && (!ok || r < room) {
+			limit, room, ok = l, r, true
+		}
+		if dir == root || !strings.HasPrefix(dir, root) {
+			return limit, room, ok
+		}
+	}
+}
+
+// readCgroupMemory reads one cgroup's memory.max, memory.current and
+// memory.stat inactive_file. set is false for "max" or a missing file.
+func readCgroupMemory(dir string) (limit, room uint64, set bool) {
+	raw, err := os.ReadFile(filepath.Join(dir, "memory.max"))
+	if err != nil {
+		return 0, 0, false
+	}
+	limit, err = strconv.ParseUint(strings.TrimSpace(string(raw)), 10, 64)
+	if err != nil {
+		return 0, 0, false
+	}
+	var used uint64
+	if raw, err := os.ReadFile(filepath.Join(dir, "memory.current")); err == nil {
+		used, _ = strconv.ParseUint(strings.TrimSpace(string(raw)), 10, 64)
+	}
+	if raw, err := os.ReadFile(filepath.Join(dir, "memory.stat")); err == nil {
+		for _, line := range strings.Split(string(raw), "\n") {
+			if v, found := strings.CutPrefix(line, "inactive_file "); found {
+				if n, err := strconv.ParseUint(strings.TrimSpace(v), 10, 64); err == nil && n <= used {
+					used -= n
+				}
+				break
+			}
+		}
+	}
+	if used >= limit {
+		return limit, 0, true
+	}
+	return limit, limit - used, true
 }
 
 func (p *LinuxMemoryProvider) procPath(elem ...string) string {
@@ -62,15 +126,30 @@ func (p *LinuxMemoryProvider) meminfoField(key string) (uint64, error) {
 	return v, nil
 }
 
-// TotalMemory is MemTotal.
+// TotalMemory is MemTotal, or the cgroup limit when that is lower.
 func (p *LinuxMemoryProvider) TotalMemory() (uint64, error) {
-	return p.meminfoField("MemTotal")
+	total, err := p.meminfoField("MemTotal")
+	if err != nil {
+		return 0, err
+	}
+	if limit, _, ok := p.cgroupLimit(); ok && limit < total {
+		return limit, nil
+	}
+	return total, nil
 }
 
-// AvailableMemory is MemAvailable. A missing field is an error, not zero:
-// the watchdog reads zero as Critical pressure.
+// AvailableMemory is MemAvailable, or the room under the cgroup limit when
+// that is lower. A missing MemAvailable is an error, not zero: the watchdog
+// reads zero as Critical pressure.
 func (p *LinuxMemoryProvider) AvailableMemory() (uint64, error) {
-	return p.meminfoField("MemAvailable")
+	avail, err := p.meminfoField("MemAvailable")
+	if err != nil {
+		return 0, err
+	}
+	if _, room, ok := p.cgroupLimit(); ok && room < avail {
+		return room, nil
+	}
+	return avail, nil
 }
 
 // WiredMemory is Mlocked, the closest Linux analogue of macOS wired pages.
