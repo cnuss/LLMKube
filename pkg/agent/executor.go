@@ -47,6 +47,9 @@ type ExecutorConfig struct {
 	Namespace   string
 	ModelSource string
 	ModelName   string
+	// OllamaModel is the Ollama tag from the Model's AnnotationOllamaModel.
+	// Empty maps ModelName through ollamaModelMap.
+	OllamaModel string
 	// ServedModelName is the model ID llama-server reports from /v1/models,
 	// emitted as --alias. Derived from spec.modelRef (fallback Model name) at
 	// the agent boundary, mirroring LlamaCppBackend.BuildArgs. Empty omits the

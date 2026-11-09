@@ -686,6 +686,13 @@ STUB_UPSTREAM_IMG ?= localhost/llmkube-stub-upstream:e2e
 docker-build-stub-upstream: ## Build docker image for the e2e stub upstream.
 	$(CONTAINER_TOOL) build -f test/e2e/stubupstream/Dockerfile -t ${STUB_UPSTREAM_IMG} .
 
+# hailo-ollama built against a fake libhailort that emulates a Hailo-10H
+# (Raspberry Pi AI HAT+ 2). Not published.
+HAILO_SIM_IMG ?= localhost/llmkube-hailo-sim:dev
+.PHONY: docker-build-hailo-sim
+docker-build-hailo-sim: ## Build the Hailo-10H simulator image (linux/arm64) for agent e2e.
+	$(CONTAINER_TOOL) build --platform linux/arm64 -t ${HAILO_SIM_IMG} test/hailosim
+
 # PLATFORMS defines the target platforms for the manager image be built to provide support to multiple
 # architectures. (i.e. make docker-buildx IMG=myregistry/mypoperator:0.0.1). To use this option you need to:
 # - be able to use docker buildx. More info: https://docs.docker.com/build/buildx/

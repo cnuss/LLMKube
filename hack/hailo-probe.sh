@@ -4,11 +4,11 @@
 #
 # Usage: hack/hailo-probe.sh [base-url] [model]
 #   base-url  default http://127.0.0.1:8000
-#   model     default qwen2.5-instruct:1.5b
+#   model     default qwen2.5:1.5b
 set -u
 
 BASE="${1:-http://127.0.0.1:8000}"
-MODEL="${2:-qwen2.5-instruct:1.5b}"
+MODEL="${2:-qwen2.5:1.5b}"
 
 section() { printf '\n== %s\n' "$1"; }
 

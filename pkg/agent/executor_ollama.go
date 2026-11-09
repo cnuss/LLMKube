@@ -88,6 +88,11 @@ type ollamaGenerateRequest struct {
 	KeepAlive *int   `json:"keep_alive,omitempty"`
 }
 
+// AnnotationOllamaModel on a Model names the Ollama tag the Ollama runtime
+// pulls and loads, for tags a Kubernetes name cannot spell (any "name:tag",
+// which every hailo-ollama model is). Experimental.
+const AnnotationOllamaModel = "llmkube.ai/ollama-model"
+
 // resolveOllamaModel maps a LLMKube model name to an Ollama model tag.
 // If no mapping exists, the original name is returned as-is (allowing users
 // to specify arbitrary Ollama model names in their Model CRD).
@@ -104,7 +109,10 @@ func resolveOllamaModel(modelName string) string {
 func (e *OllamaExecutor) StartProcess(
 	ctx context.Context, config ExecutorConfig,
 ) (*ManagedProcess, error) {
-	ollamaModel := resolveOllamaModel(config.ModelName)
+	ollamaModel := config.OllamaModel
+	if ollamaModel == "" {
+		ollamaModel = resolveOllamaModel(config.ModelName)
+	}
 
 	e.logger.Infow("starting Ollama model",
 		"llmkubeModel", config.ModelName, "ollamaModel", ollamaModel)

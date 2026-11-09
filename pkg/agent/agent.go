@@ -994,6 +994,7 @@ func buildExecutorConfig(
 		Namespace:              isvc.Namespace,
 		ModelSource:            model.Spec.Source,
 		ModelName:              model.Name,
+		OllamaModel:            model.Annotations[AnnotationOllamaModel],
 		ServedModelName:        servedModelName(isvc, model),
 		SourceSecret:           sourceSecretKeyFor(model.Namespace, model.Spec.SourceSecretRef),
 		SHA256:                 model.Spec.SHA256,
