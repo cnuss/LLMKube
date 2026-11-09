@@ -489,10 +489,14 @@ func TestMetalJoinRefusesBeforeAnyChange(t *testing.T) {
 	}
 
 	prev := newMetalHost
-	newMetalHost = func() (metalHost, error) { return metalHost{goos: "linux", home: t.TempDir()}, nil }
+	newMetalHost = func() (metalHost, error) { return metalHost{goos: "windows", home: t.TempDir()}, nil }
 	defer func() { newMetalHost = prev }()
-	if _, _, err := runMetal(t, "join", joinString); err == nil || !strings.Contains(err.Error(), "runs on the Mac") {
-		t.Errorf("join on linux: err = %v, want a refusal", err)
+	if _, _, err := runMetal(t, "join", joinString); err == nil ||
+		!strings.Contains(err.Error(), "runs on the Mac or a Linux host") {
+		t.Errorf("join on windows: err = %v, want a refusal", err)
+	}
+	if _, _, err := runMetal(t, "leave"); err == nil || !strings.Contains(err.Error(), "runs on the Mac or a Linux host") {
+		t.Errorf("leave on windows: err = %v, want a refusal", err)
 	}
 }
 

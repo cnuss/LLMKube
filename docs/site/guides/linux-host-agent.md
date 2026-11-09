@@ -41,7 +41,7 @@ Tracking issue: [#2481](https://github.com/defilantech/LLMKube/issues/2481).
 | linux/arm64 agent, `runtime: ollama` with stock Ollama on CPU | Tested in kind: `Reachable=True`, chat completions through the relay. Run it like hailo-ollama below, with `--ollama-port 11434` |
 | `runtime: ollama` against `hailo-ollama` 5.1.1 | End to end on a Raspberry Pi 5 with an AI HAT+ 2: `qwen2.5-instruct:1.5b` and `llama3.2:3b` served through the relay to a kind cluster, and back by itself after a power loss with the agent and hailo-ollama under systemd. In CI against the [Hailo-10H simulator](#testing-without-a-hat) |
 | llama.cpp (`llama-server`) on Linux | Untested. The agent's llama.cpp defaults (flash attention, mlock) are tuned for Apple Silicon |
-| `llmkube metal join` | Refuses Linux. Join [by hand](#join-the-host) |
+| `llmkube metal join` | Installs the agent as a systemd user unit. Go tests cover it with a fake `systemctl`; installing, starting and `metal leave` are tested against a real `systemctl --user` (systemd 257). Not yet run end to end on a Raspberry Pi. See [Join the host](#join-the-host) |
 | Release artifacts | None for Linux. [Build the agent](#build-the-agent) from source |
 | Raspberry Pi OS kernel (16K pages) | The agent, `hailo-h10-all` and hailo-ollama run on `6.18.50+rpt-rpi-2712` (16K pages) |
 | `llmkube deploy` for a Linux host | Untested. Write the Model and InferenceService by hand |
@@ -63,8 +63,69 @@ kubectl create namespace pi
 llmkube metal token create pi5 -n pi
 ```
 
-`metal join` cannot redeem the join string on Linux, so delete the unused
-join Secret and mint the agent's token directly:
+`token create` prints a `llmkube metal join <join-string>` line. On the host,
+as the user the agent runs as (not root), with `llmkube` and
+`llmkube-metal-agent` on `PATH` or next to each other, run it. Add the agent
+flags the host needs; for Ollama or hailo-ollama on port 8000:
+
+```sh
+llmkube metal join <join-string> \
+  --agent-arg runtime=ollama \
+  --agent-arg ollama-port=8000
+```
+
+As on a Mac, join trusts only the CA in the join string and prints its pin to
+compare. It mints the agent's own token, writes it and a kubeconfig (both
+0600) under `$XDG_DATA_HOME/llmkube/metal-agent` (`~/.local/share/...` when
+`XDG_DATA_HOME` is unset), deletes the join Secret, and waits up to `--wait`
+(3 minutes) for the `MetalNode` to report `Reachable=True`.
+
+Instead of a LaunchAgent, join installs the agent as the
+`llmkube-metal-agent.service` systemd user unit in
+`$XDG_CONFIG_HOME/systemd/user` (`~/.config/...`) and starts it with
+`systemctl --user daemon-reload` and `systemctl --user enable --now`. Its log
+is in the user journal:
+
+```sh
+journalctl --user -u llmkube-metal-agent.service -f
+```
+
+Before it spends the join string, join refuses to run as root, checks that
+this user's systemd instance answers (`systemctl --user show-environment`),
+and checks that the agent's ports are free, as on a Mac.
+
+A user's systemd instance runs only while that user has a login session,
+unless lingering is on. Without it the agent stops at logout and does not
+start at boot. join prints a hint when lingering is off and never turns it
+on itself. On a dedicated host, an admin runs:
+
+```sh
+sudo loginctl enable-linger <user>
+```
+
+Over SSH, join needs a session that sets `XDG_RUNTIME_DIR`, or lingering, to
+reach the user's instance.
+
+llama-server is optional when the agent's runtime is another one: without it,
+join goes on for `--agent-arg runtime=ollama` and leaves `--llama-server` out
+of the unit. For the default runtime it refuses, and looks in the agent's
+search paths (`/opt/homebrew/bin`, `/usr/local/bin`, `/usr/bin`) and on
+`PATH`; `--llama-server` names one elsewhere.
+
+Running join again replaces the unit and keeps the agent arguments it does not
+set itself. join refuses to replace a `llmkube-metal-agent.service` it did not
+write unless `--force`, which keeps a copy under the state directory.
+`llmkube metal leave` stops and disables the unit, runs the agent's
+`stop-engines`, removes the unit, kubeconfig and token, and reloads systemd.
+
+The unit sets `KillMode=process`: stopping or restarting it stops the agent
+but not the engines it started, which the next agent adopts, as on a Mac.
+
+### Without metal join
+
+On a host without a systemd user instance, such as a container, delete the
+unused join Secret, mint the agent's token directly, and run the agent under
+the supervisor of your choice:
 
 ```sh
 kubectl -n pi delete secret llmkube-metal-pi5-join
