@@ -16,6 +16,9 @@ the model through an ordinary Service.
 The Mac is not a Kubernetes node: nothing schedules pods on it. The cluster
 sees it as a `MetalNode` object and as the Services the agent registers.
 
+The agent also starts on Linux, experimentally; see
+[Linux Host Agent](/docs/guides/linux-host-agent).
+
 The path, in order:
 
 1. Check the [prerequisites](#prerequisites), especially the
