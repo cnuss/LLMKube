@@ -206,3 +206,9 @@ hack/hailo-probe.sh http://127.0.0.1:8000
 
 `hack/hailo-probe.sh` checks every endpoint the agent's Ollama executor and
 ingress use. Run it on a real host to compare against the simulator.
+
+`make test-e2e-host-agent` runs the whole path in kind: the operator, and two
+Linux agents in their own namespaces, each next to a simulator. It checks that
+both pass the dial-back, that each serves its own `hailo://` service through
+the relay and only its own, and that a `hailo://` Model on another accelerator
+is refused. CI runs it on every pull request.
