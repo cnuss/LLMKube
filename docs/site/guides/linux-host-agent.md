@@ -39,11 +39,11 @@ Tracking issue: [#2481](https://github.com/defilantech/LLMKube/issues/2481).
 | | Status |
 |---|---|
 | linux/arm64 agent, `runtime: ollama` with stock Ollama on CPU | Tested in kind: `Reachable=True`, chat completions through the relay. Run it like hailo-ollama below, with `--ollama-port 11434` |
-| `runtime: ollama` against `hailo-ollama` 5.1.1 | The endpoints the agent uses, checked on a Raspberry Pi 5 with an AI HAT+ 2 (`hack/hailo-probe.sh`). The agent end to end, against the [Hailo-10H simulator](#testing-without-a-hat) |
+| `runtime: ollama` against `hailo-ollama` 5.1.1 | End to end on a Raspberry Pi 5 with an AI HAT+ 2: `qwen2.5-instruct:1.5b` and `llama3.2:3b` served through the relay to a kind cluster, and back by itself after a power loss with the agent and hailo-ollama under systemd. In CI against the [Hailo-10H simulator](#testing-without-a-hat) |
 | llama.cpp (`llama-server`) on Linux | Untested. The agent's llama.cpp defaults (flash attention, mlock) are tuned for Apple Silicon |
 | `llmkube metal join` | Refuses Linux. Join [by hand](#join-the-host) |
 | Release artifacts | None for Linux. [Build the agent](#build-the-agent) from source |
-| Raspberry Pi OS kernel (16K pages) | `hailo-h10-all` and hailo-ollama run on `6.18.50+rpt-rpi-2712` (16K pages). The agent itself has not run on a Pi yet |
+| Raspberry Pi OS kernel (16K pages) | The agent, `hailo-h10-all` and hailo-ollama run on `6.18.50+rpt-rpi-2712` (16K pages) |
 | `llmkube deploy` for a Linux host | Untested. Write the Model and InferenceService by hand |
 
 ## Build the agent
@@ -165,7 +165,30 @@ runs it a copy listening on `127.0.0.1`, which hailo-ollama reads first:
 mkdir -p ~/.config/hailo-ollama
 sed 's/"0.0.0.0"/"127.0.0.1"/' /etc/xdg/hailo-ollama/hailo-ollama.json \
   > ~/.config/hailo-ollama/hailo-ollama.json
-hailo-ollama
+```
+
+The package does not start hailo-ollama at boot. Run it as a systemd user
+service, and turn on lingering so that user's services start at boot without
+a login session:
+
+```sh
+mkdir -p ~/.config/systemd/user
+cat > ~/.config/systemd/user/hailo-ollama.service <<'EOF'
+[Unit]
+Description=hailo-ollama on the AI HAT+ 2
+After=network-online.target
+
+[Service]
+ExecStart=/usr/bin/hailo-ollama
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
+EOF
+systemctl --user daemon-reload
+systemctl --user enable --now hailo-ollama.service
+sudo loginctl enable-linger "$USER"
 ```
 
 The package's install script makes `/usr/share/hailo-ollama/models`, where
@@ -230,6 +253,13 @@ Known limits, checked on a Raspberry Pi 5 with an AI HAT+ 2:
 - Requests need `Content-Type: application/json`.
 - hailo-ollama keeps one model loaded and reloads on every switch, so run one
   `InferenceService` per HAT.
+- hailo-ollama runs one generation at a time and does not stop one when its
+  client disconnects, so a request that times out keeps the HAT busy until
+  its answer is done, and the next request waits behind it. Set `max_tokens`
+  on requests to bound that.
+- The Pi 5 has no battery-backed clock and boots with the last saved time
+  until network time corrects it. Without network time, the agent's
+  heartbeats look stale and TLS certificate checks can fail.
 - The memory estimate is the HEF's size (2.2 GiB for `qwen2.5-instruct:1.5b`),
   but the budget it is checked against is the Pi's RAM, not the HAT's 8 GB. To
   test the HAT's limit, use the simulator's `HAILO_SIM_DEVICE_MEMORY`.
