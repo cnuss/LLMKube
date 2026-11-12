@@ -19,124 +19,78 @@ package agent
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"net/http"
 	"os"
 	"path/filepath"
-	"strconv"
+	"regexp"
 	"strings"
 )
 
 // DefaultHailoLibraryURL is the host hailo-ollama pulls HEFs from.
 const DefaultHailoLibraryURL = "https://dev-public.hailo.ai"
 
-// hailoManifestDirs lists the directories hailo-ollama reads its model
-// manifests from, in its order: the data home, then each data dir.
-// hailo-ollama uses the first one that exists.
-func hailoManifestDirs(home, xdgDataHome, xdgDataDirs string) []string {
-	const sub = "hailo-ollama/models/manifests"
+// hailoDigestPattern is the form of a manifest's hef_h10h, the SHA-256 that
+// names a HEF on the library host.
+var hailoDigestPattern = regexp.MustCompile(`^[0-9a-f]{64}$`)
+
+// hailoManifestsDir finds hailo-ollama's manifest directory as hailo-ollama
+// does: the first of the data home and the data dirs that has a hailo-ollama
+// directory, then models/manifests under it.
+func hailoManifestsDir(home, xdgDataHome, xdgDataDirs string) (string, error) {
 	dataHome := xdgDataHome
 	if dataHome == "" {
 		dataHome = filepath.Join(home, ".local", "share")
 	}
-	dirs := []string{filepath.Join(dataHome, sub)}
 	if xdgDataDirs == "" {
 		xdgDataDirs = "/usr/share:/usr/local/share"
 	}
+	options := []string{dataHome}
 	for _, d := range strings.Split(xdgDataDirs, ":") {
 		if d != "" {
-			dirs = append(dirs, filepath.Join(d, sub))
+			options = append(options, d)
 		}
 	}
-	return dirs
+	for _, opt := range options {
+		dir := filepath.Join(opt, "hailo-ollama")
+		if info, err := os.Stat(dir); err == nil && info.IsDir() {
+			return filepath.Join(dir, "models", "manifests"), nil
+		}
+	}
+	return "", fmt.Errorf("no hailo-ollama data directory in %s; set --hailo-manifests-dir",
+		strings.Join(options, ", "))
 }
 
-// hailoHEFFilename reads the HEF filename hailo-ollama maps tag
-// ("name:tag") to, from <dir>/<name>/<tag>/manifest.json in the first of dirs
-// that exists.
-func hailoHEFFilename(dirs []string, tag string) (string, error) {
+// hailoHEFDigest reads the digest hailo-ollama maps tag ("name:tag") to, from
+// <dir>/<name>/<tag>/manifest.json.
+func hailoHEFDigest(dir, tag string) (string, error) {
 	name, version, ok := strings.Cut(tag, ":")
 	if !ok {
 		return "", fmt.Errorf("hailo model %q has no :tag; hailo-ollama names every model name:tag", tag)
 	}
-	for _, dir := range dirs {
-		if info, err := os.Stat(dir); err != nil || !info.IsDir() {
-			continue
-		}
-		raw, err := os.ReadFile(filepath.Join(dir, name, version, "manifest.json"))
-		if err != nil {
-			return "", fmt.Errorf("hailo-ollama's manifests in %s have no %s: %w", dir, tag, err)
-		}
-		var m struct {
-			HEFFilename string `json:"hef_filename"`
-		}
-		if err := json.Unmarshal(raw, &m); err != nil {
-			return "", fmt.Errorf("manifest for %s in %s: %w", tag, dir, err)
-		}
-		if m.HEFFilename == "" || strings.ContainsAny(m.HEFFilename, "/\\") {
-			return "", fmt.Errorf("manifest for %s in %s has no usable hef_filename %q", tag, dir, m.HEFFilename)
-		}
-		return m.HEFFilename, nil
+	raw, err := os.ReadFile(filepath.Join(dir, name, version, "manifest.json"))
+	if err != nil {
+		return "", fmt.Errorf("hailo-ollama's manifests in %s have no %s: %w", dir, tag, err)
 	}
-	return "", fmt.Errorf("no hailo-ollama manifest directory found (looked in %s); set --hailo-manifests-dir",
-		strings.Join(dirs, ", "))
+	var m struct {
+		HEF string `json:"hef_h10h"`
+	}
+	if err := json.Unmarshal(raw, &m); err != nil {
+		return "", fmt.Errorf("manifest for %s in %s: %w", tag, dir, err)
+	}
+	if !hailoDigestPattern.MatchString(m.HEF) {
+		return "", fmt.Errorf("manifest for %s in %s has no hef_h10h digest (got %q)", tag, dir, m.HEF)
+	}
+	return m.HEF, nil
 }
 
-// hailoBlobVersions is the blob versions hailo-ollama tries for its own
-// version: that version, then x.y.0 when the patch is not 0, else x.(y-1).0.
-// There is no fallback across a major version.
-func hailoBlobVersions(version string) ([]string, error) {
-	parts := strings.Split(version, ".")
-	if len(parts) != 3 {
-		return nil, fmt.Errorf("hailo-ollama version %q is not major.minor.patch", version)
+// hailoBlobSize HEADs the HEF hailo-ollama would pull for digest and returns
+// its Content-Length.
+func hailoBlobSize(ctx context.Context, client *http.Client, baseURL, digest string) (uint64, error) {
+	url := strings.TrimRight(baseURL, "/") + "/blob/sha256_" + digest
+	size, err := remoteModelSize(ctx, client, url)
+	if err != nil {
+		return 0, fmt.Errorf("size %s: %w", url, err)
 	}
-	n := make([]int, 3)
-	for i, p := range parts {
-		v, err := strconv.Atoi(p)
-		if err != nil || v < 0 {
-			return nil, fmt.Errorf("hailo-ollama version %q is not major.minor.patch", version)
-		}
-		n[i] = v
-	}
-	switch {
-	case n[2] != 0:
-		return []string{version, fmt.Sprintf("%d.%d.0", n[0], n[1])}, nil
-	case n[1] != 0:
-		return []string{version, fmt.Sprintf("%d.%d.0", n[0], n[1]-1)}, nil
-	default:
-		return []string{version}, nil
-	}
-}
-
-// hailoBlobSize HEADs the HEF hailo-ollama would pull, at the first of
-// versions that has both the HEF and its .sha256 companion, and returns the
-// HEF's Content-Length. A version missing either is skipped, as hailo-ollama
-// skips it; any other failure is returned.
-func hailoBlobSize(ctx context.Context, client *http.Client, baseURL string, versions []string,
-	hefFilename string) (uint64, error) {
-	companion := strings.TrimSuffix(hefFilename, ".hef") + ".sha256"
-	base := strings.TrimRight(baseURL, "/")
-	for _, v := range versions {
-		blob := base + "/v" + v + "/blob/"
-		size, err := remoteModelSize(ctx, client, blob+hefFilename)
-		if isNotFound(err) {
-			continue
-		}
-		if err != nil {
-			return 0, fmt.Errorf("size %s at v%s: %w", hefFilename, v, err)
-		}
-		if _, err := remoteModelSize(ctx, client, blob+companion); isNotFound(err) {
-			continue
-		} else if err != nil {
-			return 0, fmt.Errorf("check %s at v%s: %w", companion, v, err)
-		}
-		return size, nil
-	}
-	return 0, fmt.Errorf("no HEF and .sha256 pair for %s at %s v%s", hefFilename, base, strings.Join(versions, " or v"))
-}
-
-func isNotFound(err error) bool {
-	var status *sizeProbeStatusError
-	return errors.As(err, &status) && status.StatusCode == http.StatusNotFound
+	return size, nil
 }

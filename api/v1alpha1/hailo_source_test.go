@@ -23,8 +23,8 @@ func TestHailoSourceTag(t *testing.T) {
 		source, tag string
 		ok, err     bool
 	}{
-		{source: "hailo://qwen2.5:1.5b", tag: "qwen2.5:1.5b", ok: true},
-		{source: "HAILO://llama3.2:1b", tag: "llama3.2:1b", ok: true},
+		{source: "hailo://qwen2.5-instruct:1.5b", tag: "qwen2.5-instruct:1.5b", ok: true},
+		{source: "HAILO://llama3.2:3b", tag: "llama3.2:3b", ok: true},
 		{source: "hailo://qwen3", tag: "qwen3", ok: true},
 		{source: "hailo://attacker.example.com/x:latest", ok: true, err: true},
 		{source: "hailo://someone/model", ok: true, err: true},

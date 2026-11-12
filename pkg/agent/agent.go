@@ -112,9 +112,6 @@ type MetalAgentConfig struct {
 	OMLXPort int
 	// OllamaPort is the port the Ollama daemon listens on (default 11434).
 	OllamaPort int
-	// HailoVersion is hailo-ollama's version (for example 5.5.0), the blob
-	// version it pulls HEFs at. Sizing a hailo:// source needs it.
-	HailoVersion string
 	// HailoManifestsDir is hailo-ollama's model manifest directory. Empty
 	// searches the directories hailo-ollama itself reads.
 	HailoManifestsDir string
@@ -2685,26 +2682,21 @@ func (a *MetalAgent) estimateModelMemory(
 }
 
 // hailoSizeProbe sizes a hailo:// source like an http(s) one, with a HEAD
-// through the download allowlist: of the HEF hailo-ollama maps the tag to in
-// its manifests, at the blob version hailo-ollama would pull.
+// through the download allowlist of the HEF hailo-ollama maps the tag to in
+// its manifests.
 func (a *MetalAgent) hailoSizeProbe(ctx context.Context, model *inferencev1alpha1.Model) (uint64, error) {
 	tag, _, err := inferencev1alpha1.HailoSourceTag(model.Spec.Source)
 	if err != nil {
 		return 0, err
 	}
-	if a.config.HailoVersion == "" {
-		return 0, errors.New("sizing a hailo:// source needs --hailo-version, hailo-ollama's version (for example 5.5.0)")
-	}
-	versions, err := hailoBlobVersions(a.config.HailoVersion)
-	if err != nil {
-		return 0, err
-	}
-	dirs := []string{a.config.HailoManifestsDir}
-	if a.config.HailoManifestsDir == "" {
+	dir := a.config.HailoManifestsDir
+	if dir == "" {
 		home, _ := os.UserHomeDir()
-		dirs = hailoManifestDirs(home, os.Getenv("XDG_DATA_HOME"), os.Getenv("XDG_DATA_DIRS"))
+		if dir, err = hailoManifestsDir(home, os.Getenv("XDG_DATA_HOME"), os.Getenv("XDG_DATA_DIRS")); err != nil {
+			return 0, err
+		}
 	}
-	hef, err := hailoHEFFilename(dirs, tag)
+	digest, err := hailoHEFDigest(dir, tag)
 	if err != nil {
 		return 0, err
 	}
@@ -2714,7 +2706,7 @@ func (a *MetalAgent) hailoSizeProbe(ctx context.Context, model *inferencev1alpha
 	}
 	probeClient := safehttp.NewClient(a.downloadAllow, 0, downloadHostsFlag)
 	defer probeClient.CloseIdleConnections()
-	return hailoBlobSize(ctx, probeClient, base, versions, hef)
+	return hailoBlobSize(ctx, probeClient, base, digest)
 }
 
 // probeRemoteModelSize sizes an http(s) source with a HEAD for its

@@ -23,7 +23,7 @@ import (
 )
 
 // HailoSourceScheme marks a Model spec.source that names a model in Hailo's
-// GenAI model zoo ("hailo://qwen2.5:1.5b"). A HEF compiled for a Hailo device
+// GenAI model zoo ("hailo://qwen2.5-instruct:1.5b"). A HEF compiled for a Hailo device
 // (such as the Raspberry Pi AI HAT+ 2's Hailo-10H), served by hailo-ollama
 // through the ollama runtime on the host agent. hailo-ollama pulls and stores
 // it, so neither the controller nor the agent downloads anything.

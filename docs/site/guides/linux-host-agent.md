@@ -39,11 +39,11 @@ Tracking issue: [#2481](https://github.com/defilantech/LLMKube/issues/2481).
 | | Status |
 |---|---|
 | linux/arm64 agent, `runtime: ollama` with stock Ollama on CPU | Tested in kind: `Reachable=True`, chat completions through the relay. Run it like hailo-ollama below, with `--ollama-port 11434` |
-| `runtime: ollama` against `hailo-ollama` | Tested against the [Hailo-10H simulator](#testing-without-a-hat), not yet on a real AI HAT+ 2 |
+| `runtime: ollama` against `hailo-ollama` 5.1.1 | The endpoints the agent uses, checked on a Raspberry Pi 5 with an AI HAT+ 2 (`hack/hailo-probe.sh`). The agent end to end, against the [Hailo-10H simulator](#testing-without-a-hat) |
 | llama.cpp (`llama-server`) on Linux | Untested. The agent's llama.cpp defaults (flash attention, mlock) are tuned for Apple Silicon |
 | `llmkube metal join` | Refuses Linux. Join [by hand](#join-the-host) |
 | Release artifacts | None for Linux. [Build the agent](#build-the-agent) from source |
-| Raspberry Pi OS kernel (16K pages) | Untested. The tests above ran on a 4K-page kernel |
+| Raspberry Pi OS kernel (16K pages) | `hailo-h10-all` and hailo-ollama run on `6.18.50+rpt-rpi-2712` (16K pages). The agent itself has not run on a Pi yet |
 | `llmkube deploy` for a Linux host | Untested. Write the Model and InferenceService by hand |
 
 ## Build the agent
@@ -105,12 +105,8 @@ llmkube-metal-agent \
   --metal-node pi5 \
   --renew-service-account-token \
   --runtime ollama \
-  --ollama-port 8000 \
-  --hailo-version 5.5.0
+  --ollama-port 8000
 ```
-
-`--hailo-version` is the version of the installed hailo-ollama (`5.5.0` for
-hailo-ollama 5.5.0); the agent needs it to size `hailo://` models, see below.
 
 The model store and state directory default to
 `$XDG_DATA_HOME/llmkube/models` and `$XDG_DATA_HOME/llmkube/metal-agent`
@@ -142,33 +138,50 @@ For a fit decision that does not depend on the machine, as in tests, set
 ## Hailo AI HAT+ 2
 
 Hailo's [hailo-ollama](https://github.com/hailo-ai/hailo_model_zoo_genai)
-serves an Ollama-compatible API on port 8000. Start it on `127.0.0.1:8000`
-(`OLLAMA_HOST=127.0.0.1:8000`) and run the agent with `--ollama-port 8000`.
+serves an Ollama-compatible API on the HAT's Hailo-10H. Raspberry Pi ships
+HailoRT 5.1.1 for it, and hailo-ollama 5.1.1 is the matching server.
 
-Name the model with a `hailo://` source: a tag in Hailo's GenAI model zoo,
-such as `hailo://qwen2.5:1.5b`. hailo-ollama maps the tag to a HEF compiled for
-the Hailo-10H through the manifests it installs, and pulls it from Hailo's
-model host (`dev-public.hailo.ai`) into its own cache, so neither the
-controller nor the agent downloads anything. The source needs
+Install the driver and runtime from Raspberry Pi's repository, and reboot:
+
+```sh
+sudo apt install dkms hailo-h10-all
+sudo reboot
+```
+
+`hailortcli fw-control identify` should then report a `HAILO10H` device.
+hailo-ollama 5.1.1 is Hailo's `hailo_gen_ai_model_zoo` package:
+
+```sh
+curl -fLO https://dev-public.hailo.ai/2025_12/Hailo10/hailo_gen_ai_model_zoo_5.1.1_arm64.deb
+sudo dpkg -i hailo_gen_ai_model_zoo_5.1.1_arm64.deb
+```
+
+hailo-ollama 5.1.1 takes its listen address only from `hailo-ollama.json`,
+and the packaged one (`/etc/xdg/hailo-ollama/hailo-ollama.json`) listens on
+`0.0.0.0:8000`, an unauthenticated API on your network. Give the user that
+runs it a copy listening on `127.0.0.1`, which hailo-ollama reads first:
+
+```sh
+mkdir -p ~/.config/hailo-ollama
+sed 's/"0.0.0.0"/"127.0.0.1"/' /etc/xdg/hailo-ollama/hailo-ollama.json \
+  > ~/.config/hailo-ollama/hailo-ollama.json
+hailo-ollama
+```
+
+The package's install script makes `/usr/share/hailo-ollama/models`, where
+hailo-ollama 5.1.1 caches the HEFs it pulls, writable by every user.
+
+Run the agent with `--runtime ollama --ollama-port 8000`, and name the model
+with a `hailo://` source: a tag in the model zoo of the installed
+hailo-ollama, which `GET /hailo/v1/list` lists. hailo-ollama 5.1.1 has
+`qwen2.5-instruct:1.5b`, `qwen2.5-coder:1.5b`, `qwen2:1.5b`, `llama3.2:3b`
+and `deepseek_r1_distill_qwen:1.5b`. hailo-ollama maps the tag to a HEF
+compiled for the Hailo-10H through the manifests it installs, and pulls it
+from Hailo's model host (`dev-public.hailo.ai`) into its own cache, so neither
+the controller nor the agent downloads anything. The source needs
 `accelerator: metal` and `runtime: ollama`; the controller marks the Model
 Failed otherwise. Only `name` or `name:tag` is accepted: a `/`, which could
 name another registry, is refused.
-
-Before it pulls, the agent checks that the daemon on `--ollama-port` is
-hailo-ollama (it serves `GET /hailo/v1/list`) and that it lists the tag, so a
-host running stock Ollama refuses the service instead of pulling a different
-model under the same name.
-
-Memory admission sizes a `hailo://` model the way it sizes an `https://` one,
-with a HEAD request and nothing downloaded: the agent reads the HEF filename
-from hailo-ollama's manifests (the directories hailo-ollama reads, or
-`--hailo-manifests-dir`), and HEADs that HEF on Hailo's model host
-(`--hailo-library-url`) at the blob version hailo-ollama would pull for
-`--hailo-version`, including its fallback to an earlier minor version. The
-HEAD goes through `--allowed-download-hosts` like any other download, so a
-host that sets that flag must list `dev-public.hailo.ai`, and it verifies TLS
-against the system's CA certificates, which Raspberry Pi OS ships (a minimal
-container image may not).
 
 ```yaml
 apiVersion: inference.llmkube.dev/v1alpha1
@@ -176,7 +189,7 @@ kind: Model
 metadata:
   name: qwen25-15b
 spec:
-  source: hailo://qwen2.5:1.5b
+  source: hailo://qwen2.5-instruct:1.5b
   hardware:
     accelerator: metal
 ---
@@ -190,23 +203,36 @@ spec:
   replicas: 1
 ```
 
-`GET /hailo/v1/list` on the host lists the tags the installed hailo-ollama
-knows.
+Like any Model change, editing the source does not restart a running
+service; change the InferenceService (or restart the agent) to pick it up.
 
-Known limits, from hailo-ollama's server code:
+Before it pulls, the agent checks that the daemon on `--ollama-port` is
+hailo-ollama (it serves `GET /hailo/v1/list`) and that it lists the tag, so a
+host running stock Ollama refuses the service instead of pulling a different
+model under the same name.
 
-- Clients must send the hailo-ollama tag (`qwen2.5:1.5b`) as `model` in the
-  request body. Nothing rewrites the service's model name.
-- `GET /v1/models` is not served.
+Memory admission sizes a `hailo://` model the way it sizes an `https://` one,
+with a HEAD request and nothing downloaded. The agent reads the HEF's SHA-256
+(`hef_h10h`) from hailo-ollama's manifest for the tag, in the directory
+hailo-ollama reads them from (`/usr/share/hailo-ollama/models/manifests` for
+the package) or `--hailo-manifests-dir`, and HEADs
+`<--hailo-library-url>/blob/sha256_<digest>`. The HEAD goes through
+`--allowed-download-hosts` like any other download, so a host that sets that
+flag must list `dev-public.hailo.ai`, and it verifies TLS against the system's
+CA certificates.
+
+Known limits, checked on a Raspberry Pi 5 with an AI HAT+ 2:
+
+- Clients must send the hailo-ollama tag (`qwen2.5-instruct:1.5b`) as
+  `model` in the request body. Nothing rewrites the service's model name.
+- `GET /v1/models` is not served, and `created` in `/v1/chat/completions` is
+  in nanoseconds.
 - Requests need `Content-Type: application/json`.
 - hailo-ollama keeps one model loaded and reloads on every switch, so run one
   `InferenceService` per HAT.
-- The memory estimate is the HEF's size (2.3 GiB for `qwen2.5:1.5b`), but
-  the budget it is checked against is the Pi's RAM, not the HAT's 8 GB. To
+- The memory estimate is the HEF's size (2.2 GiB for `qwen2.5-instruct:1.5b`),
+  but the budget it is checked against is the Pi's RAM, not the HAT's 8 GB. To
   test the HAT's limit, use the simulator's `HAILO_SIM_DEVICE_MEMORY`.
-- Sizing reproduces how hailo-ollama resolves a model to a file (its manifest
-  layout and blob versions), so a hailo-ollama release that changes either
-  breaks it until the agent follows.
 
 ## Testing without a HAT
 

@@ -84,9 +84,11 @@ type ollamaPullRequest struct {
 	Stream bool   `json:"stream"`
 }
 
+// ollamaGenerateRequest is a load or unload: no prompt field at all. An empty
+// "prompt" still generates on hailo-ollama, which treats only an absent prompt
+// as a load or unload; Ollama accepts either.
 type ollamaGenerateRequest struct {
 	Model     string `json:"model"`
-	Prompt    string `json:"prompt"`
 	KeepAlive *int   `json:"keep_alive,omitempty"`
 }
 
@@ -222,7 +224,6 @@ func (e *OllamaExecutor) UnloadModel(ctx context.Context, modelID string) error 
 	keepAlive := 0
 	payload := ollamaGenerateRequest{
 		Model:     modelID,
-		Prompt:    "",
 		KeepAlive: &keepAlive,
 	}
 
@@ -295,8 +296,7 @@ func (e *OllamaExecutor) pullModel(ctx context.Context, ollamaModel string) erro
 // can take time on large models.
 func (e *OllamaExecutor) loadModel(ctx context.Context, ollamaModel string) error {
 	payload := ollamaGenerateRequest{
-		Model:  ollamaModel,
-		Prompt: "",
+		Model: ollamaModel,
 	}
 
 	// Use a 2-minute timeout for model loading

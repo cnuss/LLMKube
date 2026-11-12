@@ -6,11 +6,9 @@
 #   - every MetalNode passes the dial-back,
 #   - each host serves its own hailo:// InferenceService through the relay,
 #     and only its own (Endpoints point at that host, logs never name the other),
-#   - memory admission sizes a hailo:// source with a HEAD of its HEF on Hailo's
-#     model host, before hailo-ollama pulls anything,
+#   - memory admission sizes a hailo:// source with a HEAD of its HEF on the
+#     simulator's model library, before hailo-ollama pulls anything,
 #   - a hailo:// Model on another accelerator is Failed with InvalidSource.
-#
-# The HEAD reaches dev-public.hailo.ai, so the run needs internet access.
 #
 # Needs docker, kind, kubectl and go. KEEP=true leaves the cluster and
 # containers up for inspection.
@@ -30,8 +28,8 @@ HOSTS=(pi mac)
 # tag is the hailo-ollama model each host serves.
 tag() {
 	case $1 in
-	pi) echo "qwen2.5:1.5b" ;;
-	mac) echo "llama3.2:1b" ;;
+	pi) echo "qwen2.5-instruct:1.5b" ;;
+	mac) echo "llama3.2:3b" ;;
 	esac
 }
 
@@ -139,17 +137,18 @@ current-context: $h
 EOF
 	chmod 600 "$dir/token" "$dir/kubeconfig"
 	docker run -d --name "$h-engine" --hostname "$h" --network kind \
-		-e OLLAMA_HOST=127.0.0.1:8000 "$HAILO_SIM_IMG" >/dev/null
-	# The agent reads hailo-ollama's manifests and version to size hailo://
-	# sources; on a real host they are on its filesystem.
-	docker cp "$h-engine:/usr/local/share/hailo-ollama/models/manifests" "$dir/manifests"
-	hailo_version=$(docker exec "$h-engine" cat /usr/local/share/hailo-sim/version)
+		-e HAILO_SIM_LISTEN=127.0.0.1:8000 -e HAILO_SIM_LIBRARY_LISTEN=127.0.0.1:8001 \
+		"$HAILO_SIM_IMG" >/dev/null
+	# The agent reads hailo-ollama's manifests to size hailo:// sources; on a
+	# real host they are on its filesystem.
+	docker cp "$h-engine:/usr/share/hailo-ollama/models/manifests" "$dir/manifests"
 	docker run -d --name "$h-agent" --network "container:$h-engine" \
 		-v "$dir:/host" -v "$WORK/llmkube-metal-agent:/usr/local/bin/llmkube-metal-agent:ro" \
 		"$AGENT_BASE_IMG" llmkube-metal-agent \
 		--kubeconfig /host/kubeconfig --namespace "$h" --metal-node "$h" \
 		--renew-service-account-token --runtime ollama --ollama-port 8000 \
-		--hailo-version "$hailo_version" --hailo-manifests-dir /host/manifests >/dev/null
+		--hailo-manifests-dir /host/manifests --hailo-library-url http://127.0.0.1:8001 \
+		--allowed-download-hosts 127.0.0.1 >/dev/null
 }
 
 deploy_service() {
@@ -251,7 +250,7 @@ apiVersion: inference.llmkube.dev/v1alpha1
 kind: Model
 metadata: {name: hailo-on-cpu, namespace: pi}
 spec:
-  source: hailo://qwen2.5:1.5b
+  source: hailo://qwen2.5-instruct:1.5b
   hardware: {accelerator: cpu}
 EOF
 wait_for "Model pi/hailo-on-cpu Failed" 120 jsonpath_is pi model/hailo-on-cpu '{.status.phase}' Failed

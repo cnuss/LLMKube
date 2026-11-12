@@ -1,23 +1,26 @@
 #!/bin/sh
-# Seeds the blob cache with a sparse HEF per installed manifest, so
-# /api/pull is a cache hit and never reaches the model CDN, then starts
-# hailo-ollama.
+# Starts hailo-ollama 5.1.1 on the simulated Hailo-10H.
 #
-#   HAILO_SIM_HEF_SIZE  Apparent size of each seeded HEF in bytes
-#                       (default 2 GiB). Compare HAILO_SIM_DEVICE_MEMORY.
+#   HAILO_SIM_LISTEN=host:port          Rewrites the server address in
+#                                       hailo-ollama.json, the only place 5.1.1
+#                                       reads it. Default: the packaged 0.0.0.0:8000.
+#   HAILO_SIM_LIBRARY_LISTEN=host:port  Serves the seeded HEFs at
+#                                       /blob/sha256_<digest>, as dev-public.hailo.ai
+#                                       does, for HEAD requests. Default
+#                                       127.0.0.1:8001; empty turns it off.
 set -eu
 
-blob="${XDG_DATA_HOME:-$HOME/.local/share}/hailo-ollama/models/blob"
-size="${HAILO_SIM_HEF_SIZE:-2147483648}"
-version="$(cat /usr/local/share/hailo-sim/version)"
-mkdir -p "$blob"
+cfg=/etc/xdg/hailo-ollama/hailo-ollama.json
+if [ -n "${HAILO_SIM_LISTEN:-}" ]; then
+	host=${HAILO_SIM_LISTEN%:*}
+	port=${HAILO_SIM_LISTEN##*:}
+	sed -i -E "/\"server\"/,/\}/ { s/\"host\": *\"[^\"]*\"/\"host\": \"$host\"/; s/\"port\": *[0-9]+/\"port\": $port/ }" "$cfg"
+fi
 
-for manifest in /usr/local/share/hailo-ollama/models/manifests/*/*/manifest.json; do
-	hef="$(sed -n 's/.*"hef_filename": *"\([^"]*\)".*/\1/p' "$manifest")"
-	[ -n "$hef" ] || continue
-	[ -e "$blob/$hef" ] && continue
-	truncate -s "$size" "$blob/$hef"
-	printf '%s' "$version" >"$blob/$hef.version"
-done
+library=${HAILO_SIM_LIBRARY_LISTEN-127.0.0.1:8001}
+if [ -n "$library" ]; then
+	python3 -m http.server --bind "${library%:*}" --directory /srv/hailo-library "${library##*:}" \
+		>/dev/null 2>&1 &
+fi
 
-exec /usr/local/bin/hailo-ollama "$@"
+exec /usr/bin/hailo-ollama "$@"

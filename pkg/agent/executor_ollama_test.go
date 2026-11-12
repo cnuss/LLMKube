@@ -40,11 +40,15 @@ func fakeOllama(t *testing.T, hailoList []string) (port int, models func() []str
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /{$}", func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte("ok")) })
 	record := func(w http.ResponseWriter, r *http.Request) {
-		var body struct{ Model string }
+		var body map[string]any
 		_ = json.NewDecoder(r.Body).Decode(&body)
+		model, _ := body["model"].(string)
+		if _, ok := body["prompt"]; ok && r.URL.Path == "/api/generate" {
+			t.Errorf("%s body has a prompt field; hailo-ollama generates for any prompt, even an empty one", r.URL.Path)
+		}
 		mu.Lock()
-		seen = append(seen, body.Model)
-		loaded = body.Model
+		seen = append(seen, model)
+		loaded = model
 		mu.Unlock()
 		_, _ = w.Write([]byte("{}"))
 	}
@@ -70,12 +74,14 @@ func fakeOllama(t *testing.T, hailoList []string) (port int, models func() []str
 }
 
 func TestOllamaExecutorModelTag(t *testing.T) {
-	hailo := []string{"qwen2.5:1.5b", "llama3.2:1b"}
+	hailo := []string{"qwen2.5-instruct:1.5b", "llama3.2:3b"}
 	for name, tc := range map[string]struct {
 		cfg  ExecutorConfig
 		want string
 	}{
-		"hailo source":         {ExecutorConfig{ModelName: "qwen25", ModelSource: "hailo://qwen2.5:1.5b"}, "qwen2.5:1.5b"},
+		"hailo source": {
+			ExecutorConfig{ModelName: "qwen25", ModelSource: "hailo://qwen2.5-instruct:1.5b"}, "qwen2.5-instruct:1.5b",
+		},
 		"mapped name":          {ExecutorConfig{ModelName: "llama-3.2-3b", ModelSource: "https://x/m.gguf"}, "llama3.2:3b"},
 		"unmapped name as tag": {ExecutorConfig{ModelName: "tinyllama"}, "tinyllama"},
 	} {
@@ -104,9 +110,11 @@ func TestOllamaExecutorRefusesHailoSourceItCannotServe(t *testing.T) {
 		source    string
 		wantErr   string
 	}{
-		"stock ollama":    {hailoList: nil, source: "hailo://qwen2.5:1.5b", wantErr: "not hailo-ollama"},
-		"catch-all 200":   {hailoList: []string{}, source: "hailo://qwen2.5:1.5b", wantErr: "does not list"},
-		"tag hailo lacks": {hailoList: []string{"qwen3:1.7b"}, source: "hailo://qwen2.5:1.5b", wantErr: "does not list"},
+		"stock ollama":  {hailoList: nil, source: "hailo://qwen2.5-instruct:1.5b", wantErr: "not hailo-ollama"},
+		"catch-all 200": {hailoList: []string{}, source: "hailo://qwen2.5-instruct:1.5b", wantErr: "does not list"},
+		"tag hailo lacks": {
+			hailoList: []string{"qwen2:1.5b"}, source: "hailo://qwen2.5-instruct:1.5b", wantErr: "does not list",
+		},
 		"registry in the tag": {
 			hailoList: []string{"x"}, source: "hailo://evil.example.com/x:1", wantErr: "not a Hailo model tag",
 		},

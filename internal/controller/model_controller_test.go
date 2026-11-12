@@ -478,8 +478,8 @@ var _ = Describe("Model Controller Reconcile", func() {
 			}
 			Expect(reasons).To(ContainElement(wantReason))
 		},
-		Entry("metal", "hailo-metal", "metal", "hailo://qwen2.5:1.5b", PhaseReady, "MetalAgentManaged"),
-		Entry("cpu", "hailo-cpu", "cpu", "hailo://qwen2.5:1.5b", PhaseFailed, ReasonInvalidSource),
+		Entry("metal", "hailo-metal", "metal", "hailo://qwen2.5-instruct:1.5b", PhaseReady, "MetalAgentManaged"),
+		Entry("cpu", "hailo-cpu", "cpu", "hailo://qwen2.5-instruct:1.5b", PhaseFailed, ReasonInvalidSource),
 		Entry("registry in the tag", "hailo-registry", "metal", "hailo://evil.example.com/x:1", PhaseFailed, ReasonInvalidSource),
 	)
 

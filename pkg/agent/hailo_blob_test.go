@@ -22,7 +22,6 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
-	"reflect"
 	"strings"
 	"testing"
 )
@@ -44,17 +43,18 @@ func fakeHailoLibrary(t *testing.T, sizes map[string]string) string {
 	return srv.URL
 }
 
-// writeHailoManifests lays out hailo-ollama's manifests/<name>/<tag>/manifest.json.
-func writeHailoManifests(t *testing.T, hefs map[string]string) string {
+// writeHailoManifests lays out manifests/<name>/<tag>/manifest.json with the
+// given hef_h10h values and returns the manifests directory.
+func writeHailoManifests(t *testing.T, digests map[string]string) string {
 	t.Helper()
 	root := t.TempDir()
-	for tag, hef := range hefs {
+	for tag, digest := range digests {
 		name, version, _ := strings.Cut(tag, ":")
 		dir := filepath.Join(root, name, version)
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			t.Fatal(err)
 		}
-		body := `{"hef_filename": "` + hef + `", "details": {"format": "hef"}}`
+		body := `{"hef_h10h": "` + digest + `", "template_params": {"eos_token": "<|endoftext|>"}}`
 		if err := os.WriteFile(filepath.Join(dir, "manifest.json"), []byte(body), 0o644); err != nil {
 			t.Fatal(err)
 		}
@@ -62,79 +62,54 @@ func writeHailoManifests(t *testing.T, hefs map[string]string) string {
 	return root
 }
 
-func TestHailoManifestDirs(t *testing.T) {
-	got := hailoManifestDirs("/home/u", "", "")
-	want := []string{
-		"/home/u/.local/share/hailo-ollama/models/manifests",
-		"/usr/share/hailo-ollama/models/manifests",
-		"/usr/local/share/hailo-ollama/models/manifests",
+const testHailoDigest = "5310176848638505fbc28add04ba60c97abe345cdb0ec7e3b8ffaa4b0a8c65dd"
+
+func TestHailoManifestsDir(t *testing.T) {
+	home := t.TempDir()
+	sys1, sys2 := t.TempDir(), t.TempDir()
+	if err := os.MkdirAll(filepath.Join(sys2, "hailo-ollama"), 0o755); err != nil {
+		t.Fatal(err)
 	}
-	if !reflect.DeepEqual(got, want) {
-		t.Errorf("defaults = %v, want %v", got, want)
+	got, err := hailoManifestsDir(home, "", sys1+":"+sys2)
+	if want := filepath.Join(sys2, "hailo-ollama", "models", "manifests"); err != nil || got != want {
+		t.Errorf("only the second data dir has hailo-ollama: %q, %v; want %q", got, err, want)
 	}
-	got = hailoManifestDirs("/home/u", "/xdg", "/a::/b")
-	want = []string{
-		"/xdg/hailo-ollama/models/manifests",
-		"/a/hailo-ollama/models/manifests",
-		"/b/hailo-ollama/models/manifests",
+
+	if err := os.MkdirAll(filepath.Join(home, ".local", "share", "hailo-ollama"), 0o755); err != nil {
+		t.Fatal(err)
 	}
-	if !reflect.DeepEqual(got, want) {
-		t.Errorf("with XDG = %v, want %v", got, want)
+	got, _ = hailoManifestsDir(home, "", sys1+":"+sys2)
+	if want := filepath.Join(home, ".local", "share", "hailo-ollama", "models", "manifests"); got != want {
+		t.Errorf("the data home wins: %q, want %q", got, want)
+	}
+
+	if _, err := hailoManifestsDir(t.TempDir(), "", sys1); err == nil {
+		t.Error("no hailo-ollama directory anywhere: want an error")
 	}
 }
 
-func TestHailoHEFFilename(t *testing.T) {
-	first := writeHailoManifests(t, map[string]string{"qwen2.5:1.5b": "Qwen2.5-1.5B-Instruct.hef"})
-	second := writeHailoManifests(t, map[string]string{"llama3.2:1b": "Llama-3.2-1B-Instruct.hef"})
-	dirs := []string{filepath.Join(t.TempDir(), "missing"), first, second}
-
-	if got, err := hailoHEFFilename(dirs, "qwen2.5:1.5b"); err != nil || got != "Qwen2.5-1.5B-Instruct.hef" {
-		t.Errorf("qwen2.5:1.5b = %q, %v", got, err)
-	}
-	if _, err := hailoHEFFilename(dirs, "llama3.2:1b"); err == nil {
-		t.Error("a tag only in a later directory: want an error, since hailo-ollama reads only the first that exists")
-	}
-	if _, err := hailoHEFFilename(dirs, "qwen3"); err == nil {
-		t.Error("a tag without :tag: want an error")
-	}
-	if _, err := hailoHEFFilename([]string{filepath.Join(t.TempDir(), "none")}, "qwen2.5:1.5b"); err == nil {
-		t.Error("no manifest directory: want an error")
-	}
-	bad := writeHailoManifests(t, map[string]string{"x:1": "../../etc/passwd"})
-	if _, err := hailoHEFFilename([]string{bad}, "x:1"); err == nil {
-		t.Error("an hef_filename with a path: want it refused")
-	}
-}
-
-func TestHailoBlobVersions(t *testing.T) {
-	for in, want := range map[string][]string{
-		"5.5.0": {"5.5.0", "5.4.0"},
-		"5.5.2": {"5.5.2", "5.5.0"},
-		"5.0.0": {"5.0.0"},
-	} {
-		if got, err := hailoBlobVersions(in); err != nil || !reflect.DeepEqual(got, want) {
-			t.Errorf("hailoBlobVersions(%s) = %v, %v; want %v", in, got, err, want)
-		}
-	}
-	for _, bad := range []string{"", "5.5", "v5.5.0", "5.x.0"} {
-		if _, err := hailoBlobVersions(bad); err == nil {
-			t.Errorf("hailoBlobVersions(%q): want an error", bad)
-		}
-	}
-}
-
-func TestHailoBlobSizeNeedsTheCompanion(t *testing.T) {
-	lib := fakeHailoLibrary(t, map[string]string{
-		"/v5.5.0/blob/M.hef":    "100",
-		"/v5.4.0/blob/M.hef":    "90",
-		"/v5.4.0/blob/M.sha256": "65",
+func TestHailoHEFDigest(t *testing.T) {
+	dir := writeHailoManifests(t, map[string]string{
+		"qwen2.5-instruct:1.5b": testHailoDigest,
+		"bad:1":                 "../../etc/passwd",
 	})
-	client := &http.Client{}
-	size, err := hailoBlobSize(context.Background(), client, lib, []string{"5.5.0", "5.4.0"}, "M.hef")
-	if err != nil || size != 90 {
-		t.Errorf("size = %d, %v; want v5.4.0's, the first version with both the HEF and its .sha256", size, err)
+	if got, err := hailoHEFDigest(dir, "qwen2.5-instruct:1.5b"); err != nil || got != testHailoDigest {
+		t.Errorf("qwen2.5-instruct:1.5b = %q, %v", got, err)
 	}
-	if _, err := hailoBlobSize(context.Background(), client, lib, []string{"5.5.0"}, "M.hef"); err == nil {
-		t.Error("only a HEF without its companion: want an error")
+	for _, tag := range []string{"bad:1", "missing:1", "qwen2.5-instruct"} {
+		if _, err := hailoHEFDigest(dir, tag); err == nil {
+			t.Errorf("%s: want an error", tag)
+		}
+	}
+}
+
+func TestHailoBlobSize(t *testing.T) {
+	lib := fakeHailoLibrary(t, map[string]string{"/blob/sha256_" + testHailoDigest: "2359716464"})
+	size, err := hailoBlobSize(context.Background(), &http.Client{}, lib+"/", testHailoDigest)
+	if err != nil || size != 2359716464 {
+		t.Errorf("size = %d, %v; want the blob's Content-Length", size, err)
+	}
+	if _, err := hailoBlobSize(context.Background(), &http.Client{}, lib, strings.Repeat("0", 64)); err == nil {
+		t.Error("a digest the library does not have: want an error")
 	}
 }

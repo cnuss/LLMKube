@@ -37,7 +37,7 @@ func hailoTestModel(source string) *inferencev1alpha1.Model {
 }
 
 func TestCheckHailoRuntime(t *testing.T) {
-	hailo := hailoTestModel("hailo://qwen2.5:1.5b")
+	hailo := hailoTestModel("hailo://qwen2.5-instruct:1.5b")
 	if err := checkHailoRuntime(hailo, runtimeOllama); err != nil {
 		t.Errorf("hailo source on ollama: %v", err)
 	}
@@ -52,38 +52,33 @@ func TestCheckHailoRuntime(t *testing.T) {
 }
 
 func TestProbeRemoteModelSizeHailo(t *testing.T) {
-	lib := fakeHailoLibrary(t, map[string]string{
-		"/v5.5.0/blob/Qwen2.5-1.5B-Instruct.hef":    "2495056733",
-		"/v5.5.0/blob/Qwen2.5-1.5B-Instruct.sha256": "65",
+	lib := fakeHailoLibrary(t, map[string]string{"/blob/sha256_" + testHailoDigest: "2359716464"})
+	manifests := writeHailoManifests(t, map[string]string{"qwen2.5-instruct:1.5b": testHailoDigest})
+	a := NewMetalAgent(MetalAgentConfig{
+		K8sClient:            fake.NewClientBuilder().WithScheme(newTestScheme()).Build(),
+		Namespace:            "default",
+		AllowedDownloadHosts: []string{"127.0.0.1"},
+		HailoManifestsDir:    manifests,
+		HailoLibraryURL:      lib,
 	})
-	manifests := writeHailoManifests(t, map[string]string{"qwen2.5:1.5b": "Qwen2.5-1.5B-Instruct.hef"})
-	newAgent := func(version string) *MetalAgent {
-		return NewMetalAgent(MetalAgentConfig{
-			K8sClient:            fake.NewClientBuilder().WithScheme(newTestScheme()).Build(),
-			Namespace:            "default",
-			AllowedDownloadHosts: []string{"127.0.0.1"},
-			HailoVersion:         version,
-			HailoManifestsDir:    manifests,
-			HailoLibraryURL:      lib,
-		})
+
+	size, probed, err := a.probeRemoteModelSize(context.Background(), hailoTestModel("hailo://qwen2.5-instruct:1.5b"))
+	if err != nil || !probed || size != 2359716464 {
+		t.Errorf("probe = %d, %v, %v; want the HEF's Content-Length", size, probed, err)
+	}
+	_, probed, err = a.probeRemoteModelSize(context.Background(), hailoTestModel("hailo://llama3.2:3b"))
+	if !probed || err == nil {
+		t.Errorf("tag not in the manifests: probe = %v, %v; want a probe error", probed, err)
 	}
 
-	for _, version := range []string{"5.5.0", "5.5.3", "5.6.0"} {
-		a := newAgent(version)
-		size, probed, err := a.probeRemoteModelSize(context.Background(), hailoTestModel("hailo://qwen2.5:1.5b"))
-		if err != nil || !probed || size != 2495056733 {
-			t.Errorf("hailo-ollama %s: probe = %d, %v, %v; want the v5.5.0 HEF's Content-Length", version, size, probed, err)
-		}
-	}
-	for name, tc := range map[string]struct{ version, source string }{
-		"no version":                  {"", "hailo://qwen2.5:1.5b"},
-		"no fallback that far":        {"5.7.0", "hailo://qwen2.5:1.5b"},
-		"tag not in manifests":        {"5.5.0", "hailo://llama3.2:1b"},
-		"cross-major has no fallback": {"6.0.0", "hailo://qwen2.5:1.5b"},
-	} {
-		_, probed, err := newAgent(tc.version).probeRemoteModelSize(context.Background(), hailoTestModel(tc.source))
-		if !probed || err == nil {
-			t.Errorf("%s: probe = %v, %v; want a probe error", name, probed, err)
-		}
+	blocked := NewMetalAgent(MetalAgentConfig{
+		K8sClient:         fake.NewClientBuilder().WithScheme(newTestScheme()).Build(),
+		Namespace:         "default",
+		HailoManifestsDir: manifests,
+		HailoLibraryURL:   lib,
+	})
+	_, _, err = blocked.probeRemoteModelSize(context.Background(), hailoTestModel("hailo://qwen2.5-instruct:1.5b"))
+	if err == nil {
+		t.Error("a library host the download allowlist refuses (loopback): want a probe error")
 	}
 }

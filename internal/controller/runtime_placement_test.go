@@ -51,7 +51,7 @@ func placementModel(name, accelerator string) *inferencev1alpha1.Model {
 
 func hailoModel(name string) *inferencev1alpha1.Model {
 	m := placementModel(name, "metal")
-	m.Spec.Source = "hailo://qwen2.5:1.5b"
+	m.Spec.Source = "hailo://qwen2.5-instruct:1.5b"
 	return m
 }
 

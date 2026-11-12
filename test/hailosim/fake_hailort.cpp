@@ -14,20 +14,21 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-// A libhailort stand-in for the slice of the HailoRT 5.x genai API that
-// hailo-ollama uses, built against HailoRT's own public headers. It emulates
-// a Hailo-10H without the device:
+// A libhailort stand-in for the slice of the HailoRT 5.1.1 genai API that
+// hailo-ollama 5.1.1 uses, built against HailoRT's own public headers. It
+// emulates a Hailo-10H without the device:
 //
 //   HAILO_SIM_DEVICE=0              VDevice creation fails (no HAT present).
 //   HAILO_SIM_DEVICE_MEMORY=<bytes> Device memory; a HEF larger than this
 //                                   fails to load. Default 8 GiB.
 //   HAILO_SIM_TOKEN_DELAY_MS=<ms>   Delay per generated token. Default 0.
 //
-// Generation is deterministic: "hailo-sim: " followed by the last user
-// message's words, one token per word, cut at max_generated_tokens.
+// hailo-ollama renders the chat template and writes the prompt text. The
+// output is deterministic: "hailo-sim:" followed by the words of the last
+// user message in that text, one token per word, cut at max_generated_tokens,
+// then an empty end-of-sequence token.
 
 #include "hailo/genai/llm/llm.hpp"
-#include "hailo/hailort_defaults.hpp"
 #include "hailo/vdevice.hpp"
 
 #include <chrono>
@@ -35,6 +36,7 @@ limitations under the License.
 #include <cstring>
 #include <deque>
 #include <filesystem>
+#include <regex>
 #include <sstream>
 #include <thread>
 
@@ -51,46 +53,31 @@ uint64_t env_u64(const char *name, uint64_t fallback)
     return std::strtoull(v, nullptr, 10);
 }
 
-// Last "content" string of the last message that has role "user". The
-// messages are JSON objects as strings; only \" and \\ escapes are decoded.
-std::string last_user_content(const std::vector<std::string> &messages)
+// last_user_text is the last line of prompt that is neither empty nor a role
+// name once special tokens (<|...|>) are removed: the last user message for
+// the ChatML and Llama 3 templates hailo-ollama renders.
+std::string last_user_text(const std::string &prompt)
 {
-    for (auto it = messages.rbegin(); it != messages.rend(); ++it) {
-        if (it->find("\"user\"") == std::string::npos) {
+    static const std::regex special("<\\|[^|]*\\|>");
+    std::istringstream lines(std::regex_replace(prompt, special, "\n"));
+    std::string last;
+    for (std::string line; std::getline(lines, line);) {
+        const auto b = line.find_first_not_of(" \t\r");
+        if (b == std::string::npos) {
             continue;
         }
-        const auto key = it->find("\"content\"");
-        if (key == std::string::npos) {
+        line = line.substr(b, line.find_last_not_of(" \t\r") - b + 1);
+        if (line == "system" || line == "user" || line == "assistant") {
             continue;
         }
-        auto pos = it->find('"', it->find(':', key) + 1);
-        if (pos == std::string::npos) {
-            continue;
-        }
-        std::string out;
-        for (++pos; pos < it->size() && (*it)[pos] != '"'; ++pos) {
-            if ((*it)[pos] == '\\' && pos + 1 < it->size()) {
-                ++pos;
-                out += ((*it)[pos] == 'n') ? ' ' : (*it)[pos];
-                continue;
-            }
-            out += (*it)[pos];
-        }
-        return out;
+        last = line;
     }
-    return "";
+    return last;
 }
 
 } // namespace
 
-hailo_vdevice_params_t HailoRTDefaults::get_vdevice_params()
-{
-    hailo_vdevice_params_t params{};
-    params.device_count = 1;
-    return params;
-}
-
-Expected<std::shared_ptr<VDevice>> VDevice::create_shared(const hailo_vdevice_params_t &)
+Expected<std::shared_ptr<VDevice>> VDevice::create_shared()
 {
     if (env_u64("HAILO_SIM_DEVICE", 1) == 0) {
         return make_unexpected(HAILO_OUT_OF_PHYSICAL_DEVICES);
@@ -208,10 +195,61 @@ hailo_status LLMGeneratorCompletion::abort()
     return HAILO_SUCCESS;
 }
 
-class LLM::Impl
+class LLMGenerator::Impl
 {
 public:
-    std::string recovery_sequence = "<|im_end|>";
+    explicit Impl(LLMGeneratorParams params) : m_params(std::move(params)) {}
+
+    hailo_status write(const std::string &text)
+    {
+        m_prompt += text;
+        return HAILO_SUCCESS;
+    }
+
+    Expected<LLMGeneratorCompletion> generate()
+    {
+        std::deque<std::string> tokens{"hailo-sim:"};
+        std::istringstream words(last_user_text(m_prompt));
+        for (std::string w; words >> w;) {
+            tokens.push_back(" " + w);
+        }
+        const auto max = m_params.max_generated_tokens();
+        const bool truncated = (max > 0) && (tokens.size() > max);
+        if (truncated) {
+            tokens.resize(max);
+        } else {
+            // The end-of-sequence token a model ends with; hailo-ollama never
+            // returns a completion's last token.
+            tokens.push_back("");
+        }
+        const std::chrono::milliseconds delay(env_u64("HAILO_SIM_TOKEN_DELAY_MS", 0));
+        return LLMGeneratorCompletion(
+            std::make_unique<LLMGeneratorCompletion::Impl>(std::move(tokens), truncated, delay));
+    }
+
+private:
+    LLMGeneratorParams m_params;
+    std::string m_prompt;
+};
+
+LLMGenerator::LLMGenerator(std::shared_ptr<Impl> pimpl) : m_pimpl(std::move(pimpl)) {}
+LLMGenerator::LLMGenerator(LLMGenerator &&other) = default;
+LLMGenerator::~LLMGenerator() = default;
+
+hailo_status LLMGenerator::write(const std::string &prompt) { return m_pimpl->write(prompt); }
+
+hailo_status LLMGenerator::write(const std::vector<std::string> &prompt_json_strings)
+{
+    for (const auto &s : prompt_json_strings) {
+        m_pimpl->write(s + "\n");
+    }
+    return HAILO_SUCCESS;
+}
+
+Expected<LLMGeneratorCompletion> LLMGenerator::generate() { return m_pimpl->generate(); }
+
+class LLM::Impl
+{
 };
 
 Expected<LLM> LLM::create(std::shared_ptr<VDevice>, const LLMParams &llm_params)
@@ -237,48 +275,18 @@ Expected<LLMGeneratorParams> LLM::create_generator_params()
     return LLMGeneratorParams(0.7f, 0.8f, 20, 1.1f, 512, true, 0);
 }
 
-Expected<LLMGeneratorCompletion> LLM::generate(const std::vector<std::string> &prompt_json_strings,
-    const std::vector<std::string> &tools_json_strings)
+Expected<LLMGenerator> LLM::create_generator(const LLMGeneratorParams &params)
 {
-    auto params = create_generator_params();
-    return generate(params.value(), prompt_json_strings, tools_json_strings);
+    return LLMGenerator(std::make_shared<LLMGenerator::Impl>(params));
 }
 
-Expected<LLMGeneratorCompletion> LLM::generate(const LLMGeneratorParams &params,
-    const std::vector<std::string> &prompt_json_strings, const std::vector<std::string> &)
+Expected<LLMGenerator> LLM::create_generator()
 {
-    std::deque<std::string> tokens{"hailo-sim:"};
-    std::istringstream words(last_user_content(prompt_json_strings));
-    for (std::string w; words >> w;) {
-        tokens.push_back(" " + w);
-    }
-    const auto max = params.max_generated_tokens();
-    const bool truncated = (max > 0) && (tokens.size() > max);
-    if (truncated) {
-        tokens.resize(max);
-    }
-    const std::chrono::milliseconds delay(env_u64("HAILO_SIM_TOKEN_DELAY_MS", 0));
-    return LLMGeneratorCompletion(std::make_unique<LLMGeneratorCompletion::Impl>(std::move(tokens), truncated, delay));
+    auto params = create_generator_params();
+    return create_generator(params.value());
 }
 
 hailo_status LLM::clear_context() { return HAILO_SUCCESS; }
-
-hailo_status LLM::set_generation_recovery_sequence(const std::string &sequence)
-{
-    m_pimpl->recovery_sequence = sequence;
-    return HAILO_SUCCESS;
-}
-
-Expected<std::string> LLM::get_generation_recovery_sequence() { return std::string(m_pimpl->recovery_sequence); }
-
-Expected<std::string> LLM::prompt_template()
-{
-    return std::string(
-        "{%- if tools %}<|im_start|>system\n# Tools\n{%- for tool in tools %}{{ tool | tojson }}{%- endfor %}"
-        "<|im_end|>\n{%- endif %}"
-        "{%- for message in messages %}<|im_start|>{{ message.role }}\n{{ message.content }}<|im_end|>\n"
-        "{%- endfor %}{%- if add_generation_prompt %}<|im_start|>assistant\n{%- endif %}");
-}
 
 } // namespace genai
 } // namespace hailort
